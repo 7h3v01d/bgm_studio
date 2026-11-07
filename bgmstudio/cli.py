@@ -5,6 +5,14 @@ import argparse
 import json
 
 
+def _parse_scenes(text: str) -> list:
+    out = []
+    for part in text.split(","):
+        mood, _, dur = part.strip().partition(":")
+        out.append({"mood": mood, "duration": float(dur)})
+    return out
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="bgmstudio")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -25,6 +33,14 @@ def main(argv=None):
     g.add_argument("--lufs", type=float, default=-20.0)
     g.add_argument("--midi", action="store_true")
 
+    q = sub.add_parser("sequence", help="per-scene music, e.g.  sequence lofi:30,cinematic:45,dark:20")
+    q.add_argument("scenes", help="comma-separated mood:seconds")
+    q.add_argument("-o", "--out-dir")
+    q.add_argument("--xfade", type=float, default=2.0)
+    q.add_argument("--seed", type=int)
+    q.add_argument("--key")
+    q.add_argument("--format", default="wav")
+
     m = sub.add_parser("mix", help="score a narration file")
     m.add_argument("narration")
     m.add_argument("mood")
@@ -33,6 +49,7 @@ def main(argv=None):
     m.add_argument("--format", default="wav")
     m.add_argument("--music-lufs", type=float, default=-26.0)
     m.add_argument("--duck-db", type=float, default=9.0)
+    m.add_argument("--scenes", help="per-scene moods, comma-separated mood:seconds (must sum to the narration length)")
 
     s = sub.add_parser("serve", help="run the REST API")
     s.add_argument("--host", default="127.0.0.1")
@@ -50,9 +67,14 @@ def main(argv=None):
         r = service.generate_bgm(a.mood, a.duration, loop=a.loop, seed=a.seed, key=a.key, mode=a.mode, bpm=a.bpm,
                                  format=a.format, target_lufs=a.lufs, out_dir=a.out_dir, midi=a.midi)
         print(json.dumps(r, indent=1))
+    elif a.cmd == "sequence":
+        r = service.generate_sequence(_parse_scenes(a.scenes), xfade=a.xfade, seed=a.seed, key=a.key,
+                                      format=a.format, out_dir=a.out_dir)
+        print(json.dumps(r, indent=1))
     elif a.cmd == "mix":
         r = service.mix_with_narration(a.narration, a.mood, seed=a.seed, format=a.format, out_dir=a.out_dir,
-                                       music_lufs=a.music_lufs, duck_db=a.duck_db)
+                                       music_lufs=a.music_lufs, duck_db=a.duck_db,
+                                       scenes=_parse_scenes(a.scenes) if a.scenes else None)
         print(json.dumps(r, indent=1))
     elif a.cmd == "serve":
         import uvicorn

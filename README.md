@@ -89,14 +89,25 @@ from bgmstudio import service
 r = service.generate_bgm("cinematic", 184.2, seed=3)      # -> {"path": ..., "bpm": ..., "seed": 3, ...}
 ```
 
+## Per-scene music (one file, moods change on your cuts)
+
+```bash
+python -m bgmstudio.cli sequence lofi:30,cinematic:45,dark:20 --seed 3
+python -m bgmstudio.cli mix narration.mp3 x --scenes lofi:30,cinematic:45,dark:20   # scene music + narration, ducked
+```
+`POST /sequence` takes `{"scenes": [{"mood": "lofi", "duration": 30}, ...], "xfade": 2.0, "seed": 3}`; `POST /mix` takes the same
+list in a `scenes` form field (JSON); MCP has `generate_scene_sequence` and a `scenes` argument on `mix_with_narration`.
+Each scene's downbeat lands exactly on its cut, all scenes share one key (auto-picked, or pass `key`), and the previous scene
+crossfades out over `xfade` seconds *after* the cut. Total length = sum of scene durations, to the sample. Scenes need to be
+4 s or longer. In `/mix`, scene durations must sum to the narration length (within 1.5 s); lead-in and tail are added for you.
+
 ## Recommended pipeline
 
 1. Make narration (your voice appliance) and visuals.
 2. `POST /mix` with the narration, or `/bgm` plus your own mixer. You get one audio file whose length is
    `lead_in + narration + tail_out`.
 3. Mux: `ffmpeg -i video_silent.mp4 -i scored_audio.wav -c:v copy -c:a aac -b:a 256k -shortest final.mp4`
-4. Per-scene moods: call `/bgm` once per scene with the scene's duration and a different mood and **the same `key`**,
-   then crossfade 1-2 s.
+4. Per-scene moods: use `/sequence` (or `scenes` in `/mix`), described above.
 
 ## Tuning
 

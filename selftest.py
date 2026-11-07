@@ -140,6 +140,34 @@ check("mix final loudness ~ -16 LUFS", abs(fl + 16) < 1.0, f"({fl:.2f})")
 lead = np.sqrt(np.mean(m_[:int(1.4*sr_)] ** 2)); tail = np.sqrt(np.mean(m_[-int(2.5*sr_):-int(0.5*sr_)] ** 2))
 check("music audible in lead-in and tail", lead > 1e-4 and tail > 1e-4, f"(lead RMS {lead:.4f}, tail RMS {tail:.4f})")
 
+# 8b. scene sequences
+scenes = [{"mood": "lofi", "duration": 20}, {"mood": "cinematic", "duration": 25.5}, {"mood": "dark", "duration": 12}]
+sa, summ, slufs, skey = service.render_sequence(scenes, xfade=2, seed=3)
+check("sequence exact total length", len(sa) == round(57.5 * SR), f"({len(sa)/SR:.3f}s)")
+check("scenes start on schedule", [x["start"] for x in summ] == [0, 20, 45.5], str([x["start"] for x in summ]))
+check("all scenes share one key", len({x["key"].split()[0] for x in summ}) == 1, f"({skey}; {[x['key'] for x in summ]})")
+mono = sa.mean(axis=1); dd = np.abs(np.diff(mono)); ref = np.percentile(dd, 99.9)
+for b in (20, 45.5):
+    i0 = int(b * SR)
+    check(f"no click at cut {b}s", dd[i0 - int(.05*SR): i0 + int(.05*SR)].max() < ref * 1.5, f"(local max {dd[i0-int(.05*SR):i0+int(.05*SR)].max():.4f}, ref {ref:.4f})")
+check("sequence loudness on target", abs(slufs + 20) < 1.5, f"({slufs:.2f} LUFS)")
+try:
+    service.render_sequence([{"mood": "lofi", "duration": 2}]); check("rejects <4s scene", False)
+except ValueError:
+    check("rejects <4s scene", True)
+r = c.post("/sequence", json={"scenes": [{"mood": "tech", "duration": 10}, {"mood": "calm", "duration": 14.25}], "seed": 2, "format": "flac"})
+d_, sr_ = sf.read(io.BytesIO(r.content))
+check("POST /sequence", r.status_code == 200 and len(d_) == round(24.25 * sr_), f"(key {r.headers['X-BGM-Key']})")
+buf = io.BytesIO(); sf.write(buf, nar, SR, format="WAV"); buf.seek(0)
+import json as _json
+r = c.post("/mix", files={"narration": ("n.wav", buf, "audio/wav")},
+           data={"scenes": _json.dumps([{"mood": "lofi", "duration": 5}, {"mood": "tech", "duration": 7}]), "seed": "8"})
+m_, sr_ = sf.read(io.BytesIO(r.content), dtype="float32")
+check("POST /mix with per-scene moods", r.status_code == 200 and abs(len(m_) / sr_ - 16.5) < 0.01, f"({len(m_)/sr_:.2f}s)")
+buf.seek(0)
+r = c.post("/mix", files={"narration": ("n.wav", buf, "audio/wav")}, data={"scenes": _json.dumps([{"mood": "lofi", "duration": 30}])})
+check("scene/narration length mismatch -> 422", r.status_code == 422)
+
 # 9. MCP over stdio
 async def mcp_roundtrip():
     from mcp import ClientSession, StdioServerParameters
@@ -154,7 +182,7 @@ async def mcp_roundtrip():
             return tools, res
 tools, res = asyncio.run(mcp_roundtrip())
 txt = res.content[0].text
-check("MCP tools listed", set(tools) == {"list_moods", "generate_bgm", "mix_with_narration"}, str(tools))
+check("MCP tools listed", set(tools) == {"list_moods", "generate_bgm", "generate_scene_sequence", "mix_with_narration"}, str(tools))
 check("MCP generate_bgm works", not getattr(res, "is_error", getattr(res, "isError", False)) and "corporate" in txt and ".wav" in txt)
 
 print("\nALL PASSED" if ok else "\nSOME CHECKS FAILED")

@@ -152,7 +152,7 @@ def render_audio(plan: Plan, soundfont: str | None = None, sr: int = SR) -> np.n
             seg = post[pos:pos + total]
             main[:len(seg)] += seg
             pos += total
-    else:
+    elif not plan.open_end:
         n = int(min(plan.fade_out, plan.duration * 0.3) * sr)
         if n > 1:
             main[-n:] *= _fade_curve(n)[:, None]

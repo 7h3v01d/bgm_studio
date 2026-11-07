@@ -1,7 +1,1 @@
 Windows: unzip the FluidSynth x64 release here (the .dll files must end up in this folder, a bin subfolder, or one folder down).
-
-Links: 
-
-fluidsynth-v2.6.2-win10-x64 - https://github.com/FluidSynth/fluidsynth/releases/download/v2.6.2/fluidsynth-v2.6.2-win10-x64-cpp11.zip
-
-fluidsynth-v2.6.2-win10-x86 - https://github.com/FluidSynth/fluidsynth/releases/download/v2.6.2/fluidsynth-v2.6.2-win10-x86-cpp11.zip

@@ -54,6 +54,7 @@ class Plan:
     reverb: tuple
     sections: list
     cal_lufs: float = -22.0
+    open_end: bool = False
 
     @property
     def total_beats(self) -> float:
@@ -218,7 +219,7 @@ def _gen_phrase(rng, scale, root_pc, degs, bpc, density):
 # ---------------------------------------------------------------- composer
 def compose(mood: str, duration: float, *, loop: bool = False, seed: int | None = None,
             key: str | None = None, mode: str | None = None, bpm: float | None = None,
-            fade_out: float = 3.0) -> Plan:
+            fade_out: float = 3.0, open_end: bool = False) -> Plan:
     name, P = resolve_mood(mood)
     duration = float(duration)
     if not (MIN_SECONDS <= duration <= MAX_SECONDS):
@@ -259,7 +260,7 @@ def compose(mood: str, duration: float, *, loop: bool = False, seed: int | None 
         for r in range(0, n, bpc):
             segs.append({"bar": start + r, "n": min(bpc, n - r), "deg": prog[(r // bpc) % len(prog)],
                          "si": si, "r": r, "kind": kind})
-    cadence = (not loop) and bars >= 3
+    cadence = (not loop) and (not open_end) and bars >= 3
     if cadence:
         kept = []
         for s in segs:
@@ -272,7 +273,7 @@ def compose(mood: str, duration: float, *, loop: bool = False, seed: int | None 
         kept.append({"bar": bars - 2, "n": 1, "deg": 3, "si": si_last, "r": -1, "kind": last_kind})
         kept.append({"bar": bars - 1, "n": 1, "deg": 0, "si": si_last, "r": -2, "kind": "end"})
         segs = kept
-    elif not loop:
+    elif not loop and not open_end:
         segs[-1] = {**segs[-1], "deg": 0}
 
     # --- note emitters
@@ -404,7 +405,7 @@ def compose(mood: str, duration: float, *, loop: bool = False, seed: int | None 
     channel_cc = {ch: {"vol": P["mix"][mixmap[ch]], "pan": pans[ch], "rev": revs[ch]} for ch in pans}
 
     return Plan(mood=name, seed=seed, key=NOTE_NAMES[key_pc], mode=mode, bpm=bpm_fit, bars=bars,
-                duration=duration, loop=loop, fade_out=fade_out, notes=notes, programs=programs,
+                duration=duration, loop=loop, fade_out=0.0 if open_end else fade_out, open_end=open_end, notes=notes, programs=programs,
                 channel_cc=channel_cc, reverb=P["reverb"], sections=sections, cal_lufs=P["cal"])
 
 
