@@ -101,6 +101,28 @@ Each scene's downbeat lands exactly on its cut, all scenes share one key (auto-p
 crossfades out over `xfade` seconds *after* the cut. Total length = sum of scene durations, to the sample. Scenes need to be
 4 s or longer. In `/mix`, scene durations must sum to the narration length (within 1.5 s); lead-in and tail are added for you.
 
+## Using it from your studio app
+
+Copy **`bgm_client.py`** into your studio project. It is one file and needs only `httpx`, so it works from any venv.
+
+```python
+from bgm_client import BGMClient
+
+with BGMClient(project_dir=r"G:\Projects\_Multimedia\bgm_studio") as bgm:   # starts the service if it isn't running
+    info = bgm.score("narration.mp3", "scored.wav", scenes="calm:20,cinematic:25,dark:20")
+    bgm.mux("silent_video.mp4", "scored.wav", "final.mp4", trim_audio_start=info["lead_in"])
+```
+* Leaving the `with` block stops the service only if the client started it. To keep one service running all day instead, use
+  `run_server.bat` and `BGMClient()` (no `project_dir`). Set `BGM_URL` / `BGM_API_KEY` / `BGM_PROJECT_DIR` to configure from outside.
+* Methods: `music`, `stream`, `sequence`, `score`, `mux`, `moods`, `health`. Errors raise `BGMError` with a readable message
+  (service down, wrong key, unknown mood, mismatched scene lengths, ffmpeg problems).
+* `score()` returns audio of `lead_in + narration + tail_out` seconds, with the narration starting at `lead_in`. If your visuals
+  start together with the narration, either pass `lead_in=0`, or `mux(..., trim_audio_start=lead_in)`.
+* Command line, no code: `python bgm_client.py score narration.mp3 -o scored.wav --scenes calm:20,dark:30`.
+
+Launchers (double-click): `run_server.bat` (API on 127.0.0.1:8765, docs at `/docs`), `run_mcp.bat` (MCP over HTTP),
+`calibrate.bat` (pre-warm streaming loudness), `test_client.bat` (tests the client end to end).
+
 ## Recommended pipeline
 
 1. Make narration (your voice appliance) and visuals.
