@@ -13,7 +13,7 @@ from .audio import (MIME, audio_duration, measure_lufs, mix_voice_and_music, nor
 from .compose import Plan, compose, export_midi
 from .calibrate import get_cal
 from .presets import describe_moods
-from .render import SR, render_audio, stream_wav
+from .render import SR, find_soundfont, render_audio, stream_wav
 
 OUT_DIR = os.path.abspath(os.environ.get("BGM_OUT_DIR", "bgm_out"))
 
@@ -55,8 +55,9 @@ def generate_bgm(mood: str = "calm", duration: float = 60.0, *, loop: bool = Fal
     """
     format = format.lower().lstrip(".")
     seed = _new_seed(seed)
+    sf_path = find_soundfont(soundfont)  # resolved font (name+size) is part of the cache key
     params = dict(mood=mood, duration=float(duration), loop=loop, seed=seed, key=key, mode=mode, bpm=bpm,
-                  fmt=format, lufs=target_lufs, fade=fade_out, sf=soundfont or os.environ.get("BGM_SOUNDFONT"))
+                  fmt=format, lufs=target_lufs, fade=fade_out, sf=f"{os.path.basename(sf_path)}:{os.path.getsize(sf_path)}")
     h = hashlib.sha1(json.dumps(params, sort_keys=True, default=str).encode()).hexdigest()[:12]
     d = _out_dir(out_dir)
     stem = f"bgm_{params['mood'].lower()}_{int(duration)}s{'_loop' if loop else ''}_{seed}_{h}"
