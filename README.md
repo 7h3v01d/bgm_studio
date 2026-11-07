@@ -101,6 +101,27 @@ Each scene's downbeat lands exactly on its cut, all scenes share one key (auto-p
 crossfades out over `xfade` seconds *after* the cut. Total length = sum of scene durations, to the sample. Scenes need to be
 4 s or longer. In `/mix`, scene durations must sum to the narration length (within 1.5 s); lead-in and tail are added for you.
 
+### Tempo matching and transition effects
+
+Both apply to `/sequence`, to `scenes` in `/mix`, to the MCP tools and to the CLI/client.
+
+* **`tempo_match`** (default on, `max_bpm_jump` default 6): picks each scene's tempo so neighbouring scenes sit within a few BPM,
+  while keeping every scene as close as possible to its mood's natural range. A 2:1 ratio counts as matched (62 and 124 BPM share a
+  pulse). Every scene except the last snaps to whole *beats* rather than whole bars (it is crossfading out anyway), which keeps the
+  tempo grid fine even for short scenes. Any cut that still can't be matched is reported as `tempo_warning` in the response.
+  Cost: scenes may sit a little outside their mood's usual tempo range. Set `tempo_match=false` for each mood's natural tempo, or
+  give a scene its own `"bpm"` to pin it.
+* **`transitions`** (default `none`), synthesised in code, tuned to the key, independent of the SoundFont:
+  `riser` (noise sweep plus a tone gliding up, ending on the cut) | `impact` (key-tuned sub boom plus reverberant burst, on the
+  downbeat) | `riser_impact` | `downlifter` (a riser reversed, starting on the cut) | `swell` (smooth gain bump into the cut) |
+  `auto` (by energy change between moods: big rise = `riser_impact`, small rise = `riser`, same = `swell`, drop = `downlifter`).
+  Put `"transition": "impact"` on a scene to override the cut *into* that scene. `fx_level_db` (default -3) sets loudness relative to
+  the music. In `/mix` the effects are part of the music bed, so they duck under speech like everything else.
+
+```bash
+python -m bgmstudio.cli sequence calm:18,cinematic:20,lofi:18,tech:18 --seed 11 --transitions auto
+```
+
 ## Using it from your studio app
 
 Copy **`bgm_client.py`** into your studio project. It is one file and needs only `httpx`, so it works from any venv.

@@ -207,23 +207,35 @@ class BGMClient:
         return {"path": out, "seed": int(r.headers["X-BGM-Seed"]), "key": r.headers["X-BGM-Key"]}
 
     def sequence(self, scenes: Scenes, out: str, *, xfade: float = 2.0, seed: Optional[int] = None,
-                 key: Optional[str] = None, target_lufs: float = -20.0, fade_out: float = 3.0) -> dict:
-        """Per-scene music in one file: moods change on your cuts, shared key, crossfaded."""
-        r = self._call("POST", "/sequence", json={"scenes": parse_scenes(scenes), "xfade": xfade, "seed": seed,
-                                                  "key": key, "format": _fmt(out), "target_lufs": target_lufs,
-                                                  "fade_out": fade_out})
-        self._save(r, out)
-        return {"path": out, "seed": int(r.headers["X-BGM-Seed"]), "key": r.headers["X-BGM-Key"],
-                "duration": float(r.headers["X-BGM-Duration"])}
+                 key: Optional[str] = None, target_lufs: float = -20.0, fade_out: float = 3.0,
+                 tempo_match: bool = True, max_bpm_jump: float = 6.0, transitions: str = "none",
+                 fx_level_db: float = -3.0) -> dict:
+        """Per-scene music in one file: moods change on your cuts, shared key, crossfaded.
+        tempo_match keeps neighbouring scenes within max_bpm_jump BPM; transitions adds a synthesized effect at each
+        cut (none | riser | impact | riser_impact | downlifter | swell | auto; or {"transition": ...} per scene).
+        Returns path/seed/key/duration plus `scenes` (per-scene bpm, start, transition_in) and `warnings`."""
+        r = self._call("POST", "/sequence", params={"as_json": "true"}, json={
+            "scenes": parse_scenes(scenes), "xfade": xfade, "seed": seed, "key": key, "format": _fmt(out),
+            "target_lufs": target_lufs, "fade_out": fade_out, "tempo_match": tempo_match,
+            "max_bpm_jump": max_bpm_jump, "transitions": transitions, "fx_level_db": fx_level_db})
+        meta = r.json()
+        os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+        self._call("GET", meta["download_url"], stream_to=out)
+        return {"path": out, "seed": meta["seed"], "key": meta["key"], "duration": meta["duration"],
+                "lufs": meta["lufs"], "scenes": meta["scenes"],
+                "warnings": [x["tempo_warning"] for x in meta["scenes"] if "tempo_warning" in x]}
 
     def score(self, narration: str, out: str, *, mood: str = "calm", scenes: Optional[Scenes] = None,
               lead_in: float = 1.5, tail_out: float = 3.0, music_lufs: float = -26.0, duck_db: float = 9.0,
               final_lufs: float = -16.0, seed: Optional[int] = None, key: Optional[str] = None,
-              xfade: float = 2.0) -> dict:
+              xfade: float = 2.0, tempo_match: bool = True, max_bpm_jump: float = 6.0,
+              transitions: str = "none", fx_level_db: float = -3.0) -> dict:
         """Narration in, finished mix out (music fitted, ducked under speech, loudness-normalised).
         The output is lead_in + narration + tail_out seconds long; the narration starts at `lead_in`."""
         data = {"mood": mood, "lead_in": lead_in, "tail_out": tail_out, "music_lufs": music_lufs,
-                "duck_db": duck_db, "final_lufs": final_lufs, "format": _fmt(out), "xfade": xfade}
+                "duck_db": duck_db, "final_lufs": final_lufs, "format": _fmt(out), "xfade": xfade,
+                "tempo_match": str(tempo_match).lower(), "max_bpm_jump": max_bpm_jump,
+                "transitions": transitions, "fx_level_db": fx_level_db}
         if seed is not None:
             data["seed"] = seed
         if key:
@@ -266,10 +278,12 @@ def main(argv=None):
     m = sub.add_parser("music"); m.add_argument("mood"); m.add_argument("duration", type=float)
     m.add_argument("-o", "--out", required=True); m.add_argument("--loop", action="store_true"); m.add_argument("--seed", type=int)
     q = sub.add_parser("sequence"); q.add_argument("scenes", help="mood:seconds,mood:seconds"); q.add_argument("-o", "--out", required=True)
-    q.add_argument("--seed", type=int)
+    q.add_argument("--seed", type=int); q.add_argument("--transitions", default="none")
+    q.add_argument("--no-tempo-match", action="store_true")
     s = sub.add_parser("score"); s.add_argument("narration"); s.add_argument("-o", "--out", required=True)
     s.add_argument("--mood", default="calm"); s.add_argument("--scenes"); s.add_argument("--seed", type=int)
-    s.add_argument("--lead-in", type=float, default=1.5)
+    s.add_argument("--lead-in", type=float, default=1.5); s.add_argument("--transitions", default="none")
+    s.add_argument("--no-tempo-match", action="store_true")
     x = sub.add_parser("mux"); x.add_argument("video"); x.add_argument("audio"); x.add_argument("-o", "--out", required=True)
     x.add_argument("--trim-audio-start", type=float, default=0.0)
     a = ap.parse_args(argv)
@@ -283,9 +297,10 @@ def main(argv=None):
             elif a.cmd == "music":
                 res = c.music(a.mood, a.duration, a.out, loop=a.loop, seed=a.seed)
             elif a.cmd == "sequence":
-                res = c.sequence(a.scenes, a.out, seed=a.seed)
+                res = c.sequence(a.scenes, a.out, seed=a.seed, transitions=a.transitions, tempo_match=not a.no_tempo_match)
             elif a.cmd == "score":
-                res = c.score(a.narration, a.out, mood=a.mood, scenes=a.scenes, seed=a.seed, lead_in=a.lead_in)
+                res = c.score(a.narration, a.out, mood=a.mood, scenes=a.scenes, seed=a.seed, lead_in=a.lead_in,
+                              transitions=a.transitions, tempo_match=not a.no_tempo_match)
             else:
                 res = {"path": c.mux(a.video, a.audio, a.out, trim_audio_start=a.trim_audio_start)}
         print(json.dumps(res, indent=1))

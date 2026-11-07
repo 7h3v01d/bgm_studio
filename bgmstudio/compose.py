@@ -55,10 +55,11 @@ class Plan:
     sections: list
     cal_lufs: float = -22.0
     open_end: bool = False
+    beats: float = 0.0
 
     @property
     def total_beats(self) -> float:
-        return self.bars * 4.0
+        return self.beats or self.bars * 4.0
 
     def summary(self) -> dict:
         return {"mood": self.mood, "seed": self.seed, "key": f"{self.key} {self.mode}",
@@ -127,10 +128,13 @@ class Voicer:
 
 
 # ---------------------------------------------------------------- structure
-def fit_bars(duration: float, target_bpm: float):
-    bar_s = 240.0 / target_bpm
-    bars = max(2, round(duration / bar_s))
-    return bars, bars * 240.0 / duration
+def fit_bars(duration: float, target_bpm: float, grain: int = 4):
+    """Snap the tempo so the piece is a whole number of `grain`-beat units long (4 = whole bars; 1 = whole beats,
+    used for scenes that crossfade out and so may end mid-bar).  -> (bars, fitted_bpm, total_beats)"""
+    unit_s = grain * 60.0 / target_bpm
+    units = max(-(-8 // grain), round(duration / unit_s))     # never shorter than 2 bars
+    beats = units * grain
+    return -(-beats // 4), beats * 60.0 / duration, beats
 
 
 def plan_sections(bars: int, loop: bool):
@@ -234,8 +238,8 @@ def compose(mood: str, duration: float, *, loop: bool = False, seed: int | None 
     key_pc = parse_key(key) if key else rng.choice(P["key_pcs"])
     root = 48 + key_pc
     target_bpm = float(bpm) if bpm else rng.uniform(*P["bpm"])
-    bars, bpm_fit = fit_bars(duration, target_bpm)
-    total = bars * 4.0
+    bars, bpm_fit, beats = fit_bars(duration, target_bpm, grain=1 if open_end else 4)
+    total = float(beats)
     bpc, seventh, swing = P["bpc"], P["seventh"], P["swing"]
     drum_style = DRUM_STYLES.get(P["drums"]) if P["drums"] else None
     sections = plan_sections(bars, loop)
@@ -405,7 +409,7 @@ def compose(mood: str, duration: float, *, loop: bool = False, seed: int | None 
     channel_cc = {ch: {"vol": P["mix"][mixmap[ch]], "pan": pans[ch], "rev": revs[ch]} for ch in pans}
 
     return Plan(mood=name, seed=seed, key=NOTE_NAMES[key_pc], mode=mode, bpm=bpm_fit, bars=bars,
-                duration=duration, loop=loop, fade_out=0.0 if open_end else fade_out, open_end=open_end, notes=notes, programs=programs,
+                duration=duration, loop=loop, fade_out=0.0 if open_end else fade_out, open_end=open_end, beats=total, notes=notes, programs=programs,
                 channel_cc=channel_cc, reverb=P["reverb"], sections=sections, cal_lufs=P["cal"])
 
 

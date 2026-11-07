@@ -48,6 +48,7 @@ class Scene(BaseModel):
     seed: Optional[int] = None
     mode: Optional[str] = None
     bpm: Optional[float] = Field(None, ge=40, le=200)
+    transition: Optional[str] = Field(None, description="transition INTO this scene; overrides the request default")
 
 
 class SequenceRequest(BaseModel):
@@ -59,6 +60,10 @@ class SequenceRequest(BaseModel):
     format: str = "wav"
     target_lufs: float = Field(-20.0, ge=-40, le=-8)
     fade_out: float = Field(3.0, ge=0, le=30)
+    tempo_match: bool = Field(True, description="pick tempos so neighbouring scenes stay close (2:1 counts as matched)")
+    max_bpm_jump: float = Field(6.0, ge=0, le=40)
+    transitions: str = Field("none", description="none, riser, impact, riser_impact, downlifter, swell, auto")
+    fx_level_db: float = Field(-3.0, ge=-24, le=6, description="transition loudness relative to the music")
 
 
 def _check_fmt(fmt: str):
@@ -107,12 +112,15 @@ def sequence(req: SequenceRequest, as_json: bool = Query(False)):
     """Per-scene music in one file: moods change on your cuts, same key, crossfaded, exact total length."""
     _check_fmt(req.format)
     r = _guard(service.generate_sequence, [s.model_dump() for s in req.scenes], xfade=req.xfade, seed=req.seed,
-               key=req.key, format=req.format, target_lufs=req.target_lufs, fade_out=req.fade_out)
+               key=req.key, format=req.format, target_lufs=req.target_lufs, fade_out=req.fade_out,
+               tempo_match=req.tempo_match, max_bpm_jump=req.max_bpm_jump, transitions=req.transitions,
+               fx_level_db=req.fx_level_db)
     name = os.path.basename(r["path"])
     if as_json:
         return {**{k: v for k, v in r.items() if k != "path"}, "file": name, "download_url": f"/files/{name}"}
     return FileResponse(r["path"], media_type=r["mime"], filename=name, headers={
-        "X-BGM-Seed": str(r["seed"]), "X-BGM-Key": r["key"], "X-BGM-Duration": str(r["duration"])})
+        "X-BGM-Seed": str(r["seed"]), "X-BGM-Key": r["key"], "X-BGM-Duration": str(r["duration"]),
+        "X-BGM-BPMs": ",".join(str(x["bpm"]) for x in r["scenes"])})
 
 
 @app.get("/bgm/stream", dependencies=[Depends(auth)])
@@ -132,7 +140,8 @@ def mix(narration: UploadFile = File(...), mood: str = Form("calm"), lead_in: fl
         tail_out: float = Form(3.0), music_lufs: float = Form(-26.0), duck_db: float = Form(9.0),
         final_lufs: float = Form(-16.0), seed: Optional[int] = Form(None), key: Optional[str] = Form(None),
         format: str = Form("wav"), scenes: Optional[str] = Form(None, description='JSON list [{"mood","duration"}]'),
-        xfade: float = Form(2.0)):
+        xfade: float = Form(2.0), tempo_match: bool = Form(True), max_bpm_jump: float = Form(6.0),
+        transitions: str = Form("none"), fx_level_db: float = Form(-3.0)):
     """Upload narration audio -> get back narration + fitted music, ducked under speech, loudness-normalised."""
     _check_fmt(format)
     try:
@@ -146,7 +155,8 @@ def mix(narration: UploadFile = File(...), mood: str = Form("calm"), lead_in: fl
             shutil.copyfileobj(narration.file, f)
         r = _guard(service.mix_with_narration, src, mood, lead_in=lead_in, tail_out=tail_out,
                    music_lufs=music_lufs, duck_db=duck_db, final_lufs=final_lufs, seed=seed, key=key, format=format,
-                   scenes=scene_list, xfade=xfade)
+                   scenes=scene_list, xfade=xfade, tempo_match=tempo_match,
+                   max_bpm_jump=max_bpm_jump, transitions=transitions, fx_level_db=fx_level_db)
     return FileResponse(r["path"], media_type=r["mime"], filename=os.path.basename(r["path"]), headers={
         "X-BGM-Seed": str(r["seed"]), "X-BGM-Total-Seconds": str(r["total_seconds"]),
         "X-BGM-Final-LUFS": str(r["final_lufs"])})

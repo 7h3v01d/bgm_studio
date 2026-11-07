@@ -192,3 +192,7 @@ def resolve_mood(name: str):
 
 def describe_moods():
     return {k: v["desc"] for k, v in PRESETS.items()}
+
+
+# Rough energy ranking (0 = barely there ... 4 = full-on); drives transitions="auto".
+ENERGY = {"ambient": 0, "calm": 1, "lofi": 2, "dark": 3, "corporate": 3, "cinematic": 4, "uplifting": 4, "tech": 4}

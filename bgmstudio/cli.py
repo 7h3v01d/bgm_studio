@@ -40,6 +40,10 @@ def main(argv=None):
     q.add_argument("--seed", type=int)
     q.add_argument("--key")
     q.add_argument("--format", default="wav")
+    q.add_argument("--transitions", default="none", help="none|riser|impact|riser_impact|downlifter|swell|auto")
+    q.add_argument("--no-tempo-match", action="store_true", help="don't bring neighbouring scenes to similar tempos")
+    q.add_argument("--max-bpm-jump", type=float, default=6.0)
+    q.add_argument("--fx-level-db", type=float, default=-3.0)
 
     m = sub.add_parser("mix", help="score a narration file")
     m.add_argument("narration")
@@ -49,6 +53,11 @@ def main(argv=None):
     m.add_argument("--format", default="wav")
     m.add_argument("--music-lufs", type=float, default=-26.0)
     m.add_argument("--duck-db", type=float, default=9.0)
+
+    m.add_argument("--transitions", default="none", help="none|riser|impact|riser_impact|downlifter|swell|auto")
+    m.add_argument("--no-tempo-match", action="store_true", help="don't bring neighbouring scenes to similar tempos")
+    m.add_argument("--max-bpm-jump", type=float, default=6.0)
+    m.add_argument("--fx-level-db", type=float, default=-3.0)
     m.add_argument("--scenes", help="per-scene moods, comma-separated mood:seconds (must sum to the narration length)")
 
     s = sub.add_parser("serve", help="run the REST API")
@@ -69,12 +78,15 @@ def main(argv=None):
         print(json.dumps(r, indent=1))
     elif a.cmd == "sequence":
         r = service.generate_sequence(_parse_scenes(a.scenes), xfade=a.xfade, seed=a.seed, key=a.key,
-                                      format=a.format, out_dir=a.out_dir)
+                                      format=a.format, out_dir=a.out_dir, tempo_match=not a.no_tempo_match,
+                                      max_bpm_jump=a.max_bpm_jump, transitions=a.transitions, fx_level_db=a.fx_level_db)
         print(json.dumps(r, indent=1))
     elif a.cmd == "mix":
         r = service.mix_with_narration(a.narration, a.mood, seed=a.seed, format=a.format, out_dir=a.out_dir,
                                        music_lufs=a.music_lufs, duck_db=a.duck_db,
-                                       scenes=_parse_scenes(a.scenes) if a.scenes else None)
+                                       scenes=_parse_scenes(a.scenes) if a.scenes else None,
+                                       tempo_match=not a.no_tempo_match, max_bpm_jump=a.max_bpm_jump,
+                                       transitions=a.transitions, fx_level_db=a.fx_level_db)
         print(json.dumps(r, indent=1))
     elif a.cmd == "serve":
         import uvicorn

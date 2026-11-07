@@ -168,6 +168,65 @@ buf.seek(0)
 r = c.post("/mix", files={"narration": ("n.wav", buf, "audio/wav")}, data={"scenes": _json.dumps([{"mood": "lofi", "duration": 30}])})
 check("scene/narration length mismatch -> 422", r.status_code == 422)
 
+# 8c. tempo matching
+HARD = [{"mood": "ambient", "duration": 20}, {"mood": "tech", "duration": 18}, {"mood": "calm", "duration": 22}, {"mood": "uplifting", "duration": 16}]
+TYPICAL = [{"mood": m, "duration": d} for m, d in [("calm", 30), ("lofi", 30), ("cinematic", 40), ("dark", 25), ("corporate", 30)]]
+for label, sc in [("hard 4-scene", HARD), ("typical 5-scene", TYPICAL)]:
+    _, off, _, _ = service.render_sequence(sc, seed=3, tempo_match=False)
+    a_, on, _, _ = service.render_sequence(sc, seed=3, tempo_match=True)
+    j_off = [x["bpm_jump_from_prev"] for x in off[1:]]; j_on = [x["bpm_jump_from_prev"] for x in on[1:]]
+    check(f"tempo match: {label} jumps <= 6 BPM", max(j_on) <= 6.5, f"(off {j_off} -> on {j_on})")
+    check(f"tempo match: {label} improves on unmatched", max(j_on) < max(j_off))
+    check(f"tempo match: {label} exact length kept", len(a_) == round(sum(x['duration'] for x in sc) * SR))
+FAST = [{"mood": m, "duration": d} for m, d in [("lofi", 12), ("tech", 9), ("dark", 14), ("uplifting", 10), ("calm", 11), ("cinematic", 13)]]
+_, on, _, _ = service.render_sequence(FAST, seed=3)
+check("tempo match: 9-14 s scenes", max(x["bpm_jump_from_prev"] for x in on[1:]) <= 6.5, f"({[x['bpm_jump_from_prev'] for x in on[1:]]})")
+_, fixed, _, _ = service.render_sequence([{"mood": "lofi", "duration": 20, "bpm": 90}, {"mood": "calm", "duration": 20}], seed=3)
+check("tempo match respects a scene's explicit bpm", abs(fixed[0]["bpm"] - 90) < 6)
+x1, _, _, _ = service.render_sequence(TYPICAL, seed=9); x2, _, _, _ = service.render_sequence(TYPICAL, seed=9)
+check("sequence is deterministic", np.array_equal(x1, x2))
+
+# 8d. transitions
+TR = [{"mood": "calm", "duration": 14}, {"mood": "cinematic", "duration": 14}, {"mood": "calm", "duration": 14}]
+cut = int(14 * SR)
+base_a, base_s, _, _ = service.render_sequence(TR, seed=4, transitions="none")
+rms = lambda a, t0, t1: float(np.sqrt(np.mean(a[int(t0*SR):int(t1*SR)] ** 2)))
+db = lambda x, y: 20 * np.log10(max(x, 1e-9) / max(y, 1e-9))
+want = {"riser": (lambda a: db(rms(a, 13.0, 14.0), rms(a, 10.0, 11.0)) - db(rms(base_a, 13.0, 14.0), rms(base_a, 10.0, 11.0)), 1.0, "riser lifts the last second before the cut"),
+        "impact": (lambda a: db(rms(a, 14.0, 14.4), rms(a, 10.0, 11.0)) - db(rms(base_a, 14.0, 14.4), rms(base_a, 10.0, 11.0)), 2.0, "impact hits on the downbeat"),
+        "riser_impact": (lambda a: db(rms(a, 14.0, 14.4), rms(a, 10.0, 11.0)) - db(rms(base_a, 14.0, 14.4), rms(base_a, 10.0, 11.0)), 2.0, "riser_impact hits on the downbeat"),
+        "downlifter": (lambda a: db(rms(a, 14.0, 15.0), rms(a, 10.0, 11.0)) - db(rms(base_a, 14.0, 15.0), rms(base_a, 10.0, 11.0)), 1.0, "downlifter adds energy after the cut"),
+        "swell": (lambda a: db(rms(a, 13.5, 14.0), rms(a, 10.0, 11.0)) - db(rms(base_a, 13.5, 14.0), rms(base_a, 10.0, 11.0)), 1.0, "swell lifts into the cut")}
+for name, (metric, need, label) in want.items():
+    a_, sm, l_, _ = service.render_sequence(TR, seed=4, transitions=name)
+    gain = metric(a_)
+    check(f"transition {name:12s} {label}", gain >= need, f"(+{gain:.1f} dB vs none)")
+    check(f"transition {name:12s} length/finite/no clipping/loudness", len(a_) == len(base_a) and np.isfinite(a_).all() and np.abs(a_).max() <= 1.0 and abs(l_ + 20) < 1.5,
+          f"(peak {np.abs(a_).max():.2f}, {l_:.1f} LUFS)")
+a_, _, _, _ = service.render_sequence(TR, seed=4, transitions="swell")
+clk = np.abs(np.diff(a_.mean(axis=1))); check("swell is smooth through the cut (no step)", clk[cut - 200:cut + 200].max() < np.percentile(clk, 99.9) * 1.5)
+_, sm, _, _ = service.render_sequence(TR, seed=4, transitions="auto")
+check("auto: calm->cinematic = riser_impact, cinematic->calm = downlifter", [x["transition_in"] for x in sm[1:]] == ["riser_impact", "downlifter"], str([x["transition_in"] for x in sm[1:]]))
+_, sm, _, _ = service.render_sequence([{"mood": "lofi", "duration": 8}, {"mood": "lofi", "duration": 8}, {"mood": "calm", "duration": 8}, {"mood": "uplifting", "duration": 8}], seed=4, transitions="auto")
+check("auto: same energy = swell, energy drop = downlifter, big rise = riser_impact", [x["transition_in"] for x in sm[1:]] == ["swell", "downlifter", "riser_impact"], str([x["transition_in"] for x in sm[1:]]))
+TR2 = [dict(x) for x in TR]; TR2[1]["transition"] = "none"; TR2[2]["transition"] = "impact"
+_, sm, _, _ = service.render_sequence(TR2, seed=4, transitions="riser")
+check("per-scene transition overrides the default", [x["transition_in"] for x in sm[1:]] == ["none", "impact"])
+for bad in ("whoosh",):
+    try:
+        service.render_sequence(TR, transitions=bad); check("rejects unknown transition", False)
+    except ValueError as e:
+        check("rejects unknown transition", "unknown transition" in str(e))
+r = c.post("/sequence?as_json=true", json={"scenes": [{"mood": "calm", "duration": 10}, {"mood": "tech", "duration": 10, "transition": "riser_impact"}],
+                                           "transitions": "swell", "seed": 2, "max_bpm_jump": 5})
+j = r.json()
+check("API /sequence transitions + tempo options", r.status_code == 200 and j["scenes"][1]["transition_in"] == "riser_impact" and "bpm_jump_from_prev" in j["scenes"][1], f"(jump {j['scenes'][1].get('bpm_jump_from_prev')})")
+check("API rejects bad transition -> 422", c.post("/sequence", json={"scenes": [{"mood": "calm", "duration": 10}], "transitions": "nope"}).status_code == 422)
+buf = io.BytesIO(); sf.write(buf, nar, SR, format="WAV"); buf.seek(0)
+r = c.post("/mix", files={"narration": ("n.wav", buf, "audio/wav")}, data={"scenes": _json.dumps([{"mood": "calm", "duration": 5}, {"mood": "tech", "duration": 7}]), "transitions": "auto", "seed": "8"})
+m_, sr_ = sf.read(io.BytesIO(r.content), dtype="float32")
+check("POST /mix with scenes + auto transitions", r.status_code == 200 and abs(len(m_) / sr_ - 16.5) < 0.01 and np.abs(m_).max() <= 1.0)
+
 # 9. MCP over stdio
 async def mcp_roundtrip():
     from mcp import ClientSession, StdioServerParameters

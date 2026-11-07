@@ -76,6 +76,11 @@ with BGMClient(URL, KEY, project_dir=HERE, server_env=env, timeout=600) as c:
     r = c.sequence([("calm", 10), ("cinematic", 12.5), ("dark", 8)], os.path.join(tmp, "seq.wav"), seed=1)
     check("sequence: exact total length", abs(dur(os.path.join(tmp, "seq.wav")) - 30.5) < 1e-3, f"(key {r['key']})")
 
+    r = c.sequence("calm:12,cinematic:12,lofi:12", os.path.join(tmp, "seq2.wav"), seed=2, transitions="auto")
+    check("sequence: details + transitions + tempo info", abs(dur(os.path.join(tmp, "seq2.wav")) - 36) < 1e-3 and
+          [x["transition_in"] for x in r["scenes"][1:]] == ["riser_impact", "downlifter"] and "bpm_jump_from_prev" in r["scenes"][1],
+          f"(bpms {[round(x['bpm'], 1) for x in r['scenes']]}, warnings {len(r['warnings'])})")
+
     # score (synthetic narration), with and without scenes
     rng = np.random.default_rng(1)
     nar = np.zeros((14 * 44100, 2), dtype=np.float32)
