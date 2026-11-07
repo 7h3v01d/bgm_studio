@@ -1,0 +1,161 @@
+"""End-to-end checks.  Run:  python selftest.py"""
+import asyncio
+import io
+import os
+import sys
+import tempfile
+import time
+
+import numpy as np
+import soundfile as sf
+
+os.environ["BGM_OUT_DIR"] = tempfile.mkdtemp(prefix="bgm_selftest_")
+from bgmstudio import service
+from bgmstudio.audio import duck_gain, measure_lufs
+from bgmstudio.compose import compose
+from bgmstudio.presets import PRESETS
+from bgmstudio.render import SR, render_audio
+
+ok = True
+
+
+def check(name, cond, detail=""):
+    global ok
+    ok &= bool(cond)
+    print(f"[{'PASS' if cond else 'FAIL'}] {name} {detail}")
+
+
+# 1. exact duration for every mood, loop and non-loop, awkward lengths
+for mood in PRESETS:
+    for dur, loop in [(5.0, True), (37.3, False), (181.7, True)]:
+        a = render_audio(compose(mood, dur, loop=loop, seed=11))
+        check(f"exact length {mood:9s} {dur:6.1f}s loop={loop}", len(a) == round(dur * SR), f"({len(a)} vs {round(dur*SR)})")
+
+# 2. determinism
+p1, p2 = compose("lofi", 60, seed=5), compose("lofi", 60, seed=5)
+check("same seed -> identical notes", [(n.start, n.pitch, n.vel) for n in p1.notes] == [(n.start, n.pitch, n.vel) for n in p2.notes])
+check("same seed -> identical audio", np.array_equal(render_audio(p1), render_audio(p2)))
+p3 = compose("lofi", 60, seed=6)
+check("different seed -> different music", [(n.start, n.pitch) for n in p1.notes] != [(n.start, n.pitch) for n in p3.notes])
+
+# 3. loop seam: wrap the file around and look at the join
+def seam_stats(a):
+    m = a.mean(axis=1)
+    wrapped = np.concatenate([m[-SR:], m[:SR]])           # 1 s either side of the join
+    d = np.abs(np.diff(wrapped))
+    j = len(m[-SR:]) - 1
+    seam_jump = d[j]
+    ref = np.percentile(np.delete(d, j), 99.9)
+    # energy continuity: RMS of the 150 ms either side of the join
+    pre = np.sqrt(np.mean(wrapped[j - int(.15*SR):j] ** 2)); post = np.sqrt(np.mean(wrapped[j:j + int(.15*SR)] ** 2))
+    return seam_jump, ref, pre, post
+
+for mood in ["lofi", "cinematic", "ambient", "tech"]:
+    a = render_audio(compose(mood, 40, loop=True, seed=3))
+    jump, ref, pre, post = seam_stats(a)
+    check(f"loop seam click-free  {mood:9s}", jump <= ref * 1.5 + 1e-4, f"(jump {jump:.5f}, 99.9th pct {ref:.5f})")
+    ratio = max(pre, post) / max(min(pre, post), 1e-9)
+    check(f"loop seam energy even {mood:9s}", ratio < 2.5, f"(RMS before {pre:.4f}, after {post:.4f})")
+
+# tail fold really happens: the start of a loop must contain the ringing tail of the end
+pl = compose("cinematic", 40, loop=True, seed=3)
+folded = render_audio(pl)
+import dataclasses
+unfolded = render_audio(dataclasses.replace(pl, loop=False, fade_out=0))
+head = slice(0, int(1.5 * SR))
+check("tail is folded onto loop start", np.sqrt(np.mean(folded[head] ** 2)) > np.sqrt(np.mean(unfolded[head] ** 2)) * 1.02)
+
+# 4. non-loop ends with a fade to silence
+a = render_audio(compose("calm", 30, loop=False, seed=2))
+check("non-loop fades to silence", np.abs(a[-200:]).max() < 1e-3 and np.abs(a[-int(2*SR):-int(1.5*SR)]).max() > 1e-3)
+
+# 5. loudness targeting
+r = service.generate_bgm("uplifting", 30, seed=9, target_lufs=-20.0)
+data, sr = sf.read(r["path"])
+check("loudness lands on target", abs(measure_lufs(data.astype("float32"), sr) + 20.0) < 0.6, f"({measure_lufs(data.astype('float32'), sr):.2f} LUFS)")
+check("cache hit on repeat", service.generate_bgm("uplifting", 30, seed=9, target_lufs=-20.0)["cached"])
+check("midi export", os.path.getsize(service.generate_bgm("lofi", 20, seed=1, midi=True)["midi_path"]) > 200)
+check("mp3 encode", os.path.getsize(service.generate_bgm("calm", 12, seed=1, format="mp3")["path"]) > 5000)
+
+# 6. long-form scales: 20 min renders fast, sections evolve
+t = time.time()
+r = service.generate_bgm("ambient", 1200, seed=4, format="flac")
+el = time.time() - t
+check("20-minute track", r["samples"] == 1200 * SR, f"({el:.1f}s wall, {1200/el:.0f}x realtime, sections={len(r['sections'])})")
+
+# 7. ducking behaves
+sr = SR
+rng = np.random.default_rng(0)
+voice = np.zeros((12 * sr, 2), dtype=np.float32)
+for s, e in [(1, 3), (6, 8)]:
+    voice[int(s*sr):int(e*sr)] = rng.normal(0, .1, (int((e-s)*sr), 2))
+# short gaps between words must NOT make the music pump
+for k in range(int(1.2*10), int(2.8*10), 4):
+    voice[int(k/10*sr):int((k/10+0.12)*sr)] = 0
+g = duck_gain(voice)
+db = lambda t: 20 * np.log10(g[int(t*sr)])
+check("music ducks during speech", g[int(2*sr)] < 0.4, f"({db(2):.1f} dB while talking)")
+check("no pumping across 120 ms word gaps", g[int(1.5*sr):int(2.8*sr)].max() < 0.45, f"(worst {20*np.log10(g[int(1.5*sr):int(2.8*sr)].max()):.1f} dB)")
+check("ducks before first word (look-ahead)", g[int(0.98*sr)] < 0.9, f"({db(0.98):.1f} dB at 20 ms before onset)")
+check("music recovers in a long pause", g[int(5.8*sr)] > 0.85, f"({db(5.8):.1f} dB)")
+check("music recovers after final word", g[-1] > 0.95, f"({db(11.99):.1f} dB)")
+
+# 8. API
+from fastapi.testclient import TestClient
+from bgmstudio.api import app
+c = TestClient(app)
+check("GET /health", c.get("/health").json()["ok"])
+check("GET /moods", set(c.get("/moods").json()) == set(PRESETS))
+r = c.post("/bgm", json={"mood": "lofi", "duration": 25, "loop": True, "seed": 42, "format": "wav"})
+d_, sr_ = sf.read(io.BytesIO(r.content))
+check("POST /bgm returns audio", r.status_code == 200 and len(d_) == 25 * sr_ and r.headers["X-BGM-Seed"] == "42", f"(bpm {r.headers['X-BGM-BPM']}, key {r.headers['X-BGM-Key']})")
+j = c.post("/bgm?as_json=true", json={"mood": "tech", "duration": 15, "seed": 1}).json()
+check("POST /bgm?as_json", c.get(j["download_url"]).status_code == 200)
+check("bad mood -> 422", c.post("/bgm", json={"mood": "nope", "duration": 10}).status_code == 422)
+check("bad duration -> 422", c.post("/bgm", json={"mood": "calm", "duration": 1}).status_code == 422)
+
+t = time.time()
+with c.stream("GET", "/bgm/stream", params={"mood": "cinematic", "duration": 120, "seed": 3}) as resp:
+    it = resp.iter_bytes(65536)
+    first = next(it); t_first = time.time() - t
+    body = first + b"".join(it)
+t_all = time.time() - t
+d_, sr_ = sf.read(io.BytesIO(body))
+lu = measure_lufs(d_.astype("float32"), sr_)
+check("stream: exact length + Content-Length", len(d_) == 120 * sr_ and int(resp.headers["content-length"]) == len(body))
+check("stream: loudness near target (no look-ahead)", abs(lu + 20) < 2.5, f"({lu:.1f} LUFS)")
+check("stream: faster than realtime", t_all < 120 / 5, f"(first bytes {t_first:.2f}s, all 120s audio in {t_all:.1f}s)")
+
+# mix: synthetic narration (bursts of noise) through the API
+nar = np.zeros((12 * SR, 2), dtype=np.float32)
+for s, e in [(0.3, 3.0), (4.0, 7.0), (8.0, 11.5)]:
+    seg = rng.normal(0, .12, (int((e - s) * SR), 2)).astype(np.float32)
+    nar[int(s*SR):int(e*SR)] = seg
+buf = io.BytesIO(); sf.write(buf, nar, SR, format="WAV"); buf.seek(0)
+r = c.post("/mix", files={"narration": ("n.wav", buf, "audio/wav")}, data={"mood": "calm", "seed": "8"})
+m_, sr_ = sf.read(io.BytesIO(r.content), dtype="float32")
+check("POST /mix total length = lead+narration+tail", r.status_code == 200 and abs(len(m_) / sr_ - (1.5 + 12 + 3)) < 0.01, f"({len(m_)/sr_:.2f}s)")
+fl = measure_lufs(m_, sr_)
+check("mix final loudness ~ -16 LUFS", abs(fl + 16) < 1.0, f"({fl:.2f})")
+lead = np.sqrt(np.mean(m_[:int(1.4*sr_)] ** 2)); tail = np.sqrt(np.mean(m_[-int(2.5*sr_):-int(0.5*sr_)] ** 2))
+check("music audible in lead-in and tail", lead > 1e-4 and tail > 1e-4, f"(lead RMS {lead:.4f}, tail RMS {tail:.4f})")
+
+# 9. MCP over stdio
+async def mcp_roundtrip():
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+    params = StdioServerParameters(command=sys.executable, args=["-m", "bgmstudio.mcp_server"],
+                                   env={**os.environ, "BGM_OUT_DIR": os.environ["BGM_OUT_DIR"]})
+    async with stdio_client(params) as (r, w):
+        async with ClientSession(r, w) as s:
+            await s.initialize()
+            tools = [t.name for t in (await s.list_tools()).tools]
+            res = await s.call_tool("generate_bgm", {"mood": "corporate", "duration_seconds": 20, "seed": 5, "loop": True})
+            return tools, res
+tools, res = asyncio.run(mcp_roundtrip())
+txt = res.content[0].text
+check("MCP tools listed", set(tools) == {"list_moods", "generate_bgm", "mix_with_narration"}, str(tools))
+check("MCP generate_bgm works", not getattr(res, "is_error", getattr(res, "isError", False)) and "corporate" in txt and ".wav" in txt)
+
+print("\nALL PASSED" if ok else "\nSOME CHECKS FAILED")
+sys.exit(0 if ok else 1)
