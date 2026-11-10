@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (GitHub: 7h3v01d)
 """Synthesised transition effects for scene cuts (pure numpy; no samples or SoundFont needed).
 
   riser        band-limited noise sweeping upward + a tone gliding into the key, ending right at the cut
@@ -108,11 +110,17 @@ def _rms(x: np.ndarray) -> float:
 
 
 def apply_transition(out: np.ndarray, name: str, cut: int, sr: int, *, seed: int, key_pc: int, level_db: float,
-                     prev_len: float, next_len: float) -> None:
+                     prev_len: float, next_len: float, fx_out: np.ndarray | None = None) -> None:
     """Mix a transition into `out` in place around sample index `cut` (the new scene's downbeat).
-    `level_db` is relative to the local music RMS (riser/downlifter end/start level)."""
+    `level_db` is relative to the local music RMS (riser/downlifter end/start level).
+
+    fx_out: when given, the added sounds (riser, impact, downlifter) go there instead of into `out`, so music and
+    effects stay separate stems; levels are still measured on music + effects and a swell scales both, so
+    out + fx_out ends up exactly what `out` alone would have been."""
     n_total = len(out)
-    ref = _rms(out[max(0, cut - 3 * sr):min(n_total, cut + sr)])
+    lo, hi = max(0, cut - 3 * sr), min(n_total, cut + sr)
+    ref = _rms(out[lo:hi] if fx_out is None else out[lo:hi] + fx_out[lo:hi])
+    dest = out if fx_out is None else fx_out
     if ref <= 0 or name == "none":
         return
     gain = 10 ** (level_db / 20.0)
@@ -123,18 +131,21 @@ def apply_transition(out: np.ndarray, name: str, cut: int, sr: int, *, seed: int
             start = max(0, cut - len(r))
             r = r[len(r) - (cut - start):]
             r = r * (ref * gain / max(_rms(r[-sr:]), 1e-9))
-            out[start:cut] += r
+            dest[start:cut] += r
     if name in ("impact", "riser_impact"):
         im = impact(sr, seed + 1, key_pc)
         im = im * (ref * gain * 1.6 / max(_rms(im[:sr // 2]), 1e-9))
         seg = im[:max(0, n_total - cut)]
-        out[cut:cut + len(seg)] += seg
+        dest[cut:cut + len(seg)] += seg
     if name == "downlifter":
         length = min(3.2, next_len * 0.6)
         if length >= 0.5:
             d = downlifter(length, sr, seed + 2, key_pc)
             d = d * (ref * gain / max(_rms(d[:sr]), 1e-9))
             seg = d[:max(0, n_total - cut)]
-            out[cut:cut + len(seg)] += seg
+            dest[cut:cut + len(seg)] += seg
     if name == "swell":
-        out *= swell_curve(n_total, cut, sr)[:, None]
+        curve = swell_curve(n_total, cut, sr)[:, None]
+        out *= curve
+        if fx_out is not None:
+            fx_out *= curve

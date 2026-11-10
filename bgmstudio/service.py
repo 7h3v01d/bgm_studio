@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (GitHub: 7h3v01d)
 """Core operations shared by the REST API, the MCP server and the CLI."""
 from __future__ import annotations
 
@@ -5,18 +7,81 @@ import hashlib
 import json
 import os
 import random
+import threading
+from contextlib import contextmanager
 
 import numpy as np
 
-from .audio import (MIME, audio_duration, measure_lufs, mix_voice_and_music, normalize_lufs,
-                    read_audio, write_audio)
-from .compose import MIN_SECONDS, NOTE_NAMES, Plan, compose, export_midi, fit_bars, parse_key
+from . import provenance
+from .audio import (MIME, audio_duration, loudness_gain, measure_lufs, mix_voice_and_music, normalize_lufs,
+                    read_audio, write_audio, write_json)
+from .cues import merge as merge_cues, plan_cues, track_cues
+from .compose import INTENSITY_SPAN_DB, parse_intensity, MIN_SECONDS, NOTE_NAMES, Plan, compose, export_midi, fit_bars, parse_key
 from .calibrate import get_cal
-from .fx import TRANSITIONS, apply_transition
+from .fx import TRANSITIONS, apply_transition, swell_curve
 from .presets import ENERGY, describe_moods, resolve_mood
-from .render import SR, find_soundfont, render_audio, stream_wav
+from .render import SR, find_soundfont, render_audio, render_split, stem_plans, stream_wav
 
 OUT_DIR = os.path.abspath(os.environ.get("BGM_OUT_DIR", "bgm_out"))
+
+# Valid ranges, shared by the REST API, MCP tools, CLI and library callers.  (lo, hi) inclusive.
+LIMITS = {
+    "target_lufs": (-40.0, -8.0), "music_lufs": (-40.0, -8.0), "final_lufs": (-40.0, -8.0),
+    "voice_lufs": (-40.0, -8.0), "fade_out": (0.0, 30.0), "lead_in": (0.0, 30.0), "tail_out": (0.0, 60.0),
+    "duck_db": (0.0, 40.0), "xfade": (0.0, 10.0), "max_bpm_jump": (0.0, 40.0), "fx_level_db": (-24.0, 6.0),
+    "bpm": (40.0, 200.0),
+}
+
+
+def check_ranges(**values) -> None:
+    """Raise ValueError naming the first argument outside LIMITS.  None values are skipped (= use default)."""
+    for name, v in values.items():
+        if v is None:
+            continue
+        lo, hi = LIMITS[name]
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            raise ValueError(f"{name} must be a number, got {v!r}") from None
+        if not (lo <= f <= hi):
+            raise ValueError(f"{name} must be between {lo:g} and {hi:g}, got {f:g}")
+
+
+MAX_STEM_SECONDS = 3600.0  # stems hold ~3 full-length buffers in memory (about 1.3 GB each per hour of audio)
+
+
+def _stem_path(path: str, name: str) -> str:
+    root, ext = os.path.splitext(path)
+    return f"{root}.stem-{name}{ext}"
+
+
+def _check_stems(stems: bool, seconds: float) -> None:
+    if stems and seconds > MAX_STEM_SECONDS:
+        raise ValueError(f"stems are limited to {MAX_STEM_SECONDS / 60:.0f} minutes per file "
+                         f"(asked for {seconds / 60:.1f}); render the long bed without stems")
+
+
+def _meta_complete(meta: dict, *, stems: bool, midi_path: str | None = None) -> bool:
+    """A cache entry is reusable if it was written by a version that records cues and provenance, and has every
+    file this request wants."""
+    if "cues" not in meta or "provenance" not in meta:
+        return False
+    if stems and not (meta.get("stems") and all(os.path.isfile(p) for p in meta["stems"].values())):
+        return False
+    return not midi_path or os.path.isfile(midi_path)
+
+
+_key_locks: dict = {}
+_key_locks_guard = threading.Lock()
+
+
+@contextmanager
+def _render_lock(path: str):
+    """Serialise work on one output path, so identical concurrent requests render once and the rest hit the cache."""
+    with _key_locks_guard:
+        lock = _key_locks.setdefault(path, threading.Lock())
+    with lock:
+        yield
 
 
 def _out_dir(d=None) -> str:
@@ -34,73 +99,122 @@ def _new_seed(seed):
 
 
 def render_music(mood: str, duration: float, *, loop=False, seed=None, key=None, mode=None, bpm=None,
-                 fade_out=3.0, target_lufs=-20.0, soundfont=None):
-    """-> (float32 stereo array, Plan, achieved LUFS).  Exactly round(duration*SR) samples."""
+                 fade_out=3.0, target_lufs=-20.0, soundfont=None, intensity=None, split=False):
+    """-> (float32 stereo array, Plan, achieved LUFS, applied linear gain).  Exactly round(duration*SR) samples."""
     plan = compose(mood, duration, loop=loop, seed=_new_seed(seed), key=key, mode=mode, bpm=bpm,
-                   fade_out=fade_out)
-    audio = render_audio(plan, soundfont)
-    audio, lufs = normalize_lufs(audio, target_lufs)
-    return audio, plan, lufs
+                   fade_out=fade_out, intensity=intensity)
+    raw = render_split(plan, soundfont) if split else render_audio(plan, soundfont)
+    gain, lufs = loudness_gain(raw, target_lufs)
+    audio = raw if lufs is None else (raw * gain).astype(np.float32)
+    return audio, plan, lufs, gain
 
 
 def generate_bgm(mood: str = "calm", duration: float = 60.0, *, loop: bool = False, seed: int | None = None,
                  key: str | None = None, mode: str | None = None, bpm: float | None = None,
                  format: str = "wav", target_lufs: float = -20.0, fade_out: float = 3.0,
                  soundfont: str | None = None, out_dir: str | None = None, midi: bool = False,
-                 use_cache: bool = True) -> dict:
+                 use_cache: bool = True, intensity=None, stems: bool = False) -> dict:
     """Generate a background-music file of exactly `duration` seconds.
 
     loop=True  -> sample-seamless loop (no fade, tail folded onto the start).
     loop=False -> proper cadence ending plus a fade-out.
+    intensity  0..1, or a list of 0..1 points spread evenly across the track (a tension curve).
+    stems      also write one file per instrument group (pad, bass, keys, melody, sparkle, drums); the main file is
+               built from them, so they add up to it exactly.  Paths in result["stems"].  A stems render can differ
+               from a plain render of the same seed in the first milliseconds of some notes (see render_split).
+    Every result has "cues" (bars, sections; see cues.py) and "provenance" (see provenance.py), and the same
+    record is saved next to the audio as <file>.json ("meta_path").
     The same (mood, duration, seed, ...) always gives the same music; the seed is returned.
     """
     format = format.lower().lstrip(".")
-    seed = _new_seed(seed)
+    if format not in MIME:
+        raise ValueError(f"format must be one of {', '.join(MIME)}")
+    check_ranges(target_lufs=target_lufs, fade_out=fade_out, bpm=bpm)
+    intensity = parse_intensity(intensity)
+    _check_stems(stems, float(duration))
+    mood = resolve_mood(mood)[0]  # canonical name: aliases share one cache entry, and nothing unvalidated
+    seed = _new_seed(seed)        # ever reaches a file name
     sf_path = find_soundfont(soundfont)  # resolved font (name+size) is part of the cache key
     params = dict(mood=mood, duration=float(duration), loop=loop, seed=seed, key=key, mode=mode, bpm=bpm,
                   fmt=format, lufs=target_lufs, fade=fade_out, sf=f"{os.path.basename(sf_path)}:{os.path.getsize(sf_path)}")
+    if intensity is not None:  # only when used, so files cached without intensity keep their names
+        params["intensity"] = intensity
+    if stems:  # a stems render builds its mix from the stems, so it is its own cache entry (see render_split)
+        params["stems"] = True
     h = hashlib.sha1(json.dumps(params, sort_keys=True, default=str).encode()).hexdigest()[:12]
     d = _out_dir(out_dir)
     stem = f"bgm_{params['mood'].lower()}_{int(duration)}s{'_loop' if loop else ''}_{seed}_{h}"
     path, meta_path, mid_path = (os.path.join(d, stem + ext) for ext in (f".{format}", ".json", ".mid"))
-    if use_cache and os.path.isfile(path) and os.path.isfile(meta_path) and (not midi or os.path.isfile(mid_path)):
-        with open(meta_path) as f:
-            return {**json.load(f), "cached": True}
+    with _render_lock(path):
+        if use_cache and os.path.isfile(path) and os.path.isfile(meta_path):
+            with open(meta_path) as f:
+                meta = json.load(f)
+            if _meta_complete(meta, stems=stems, midi_path=mid_path if midi else None):
+                return {**meta, "cached": True}
 
-    audio, plan, lufs = render_music(mood, duration, loop=loop, seed=seed, key=key, mode=mode, bpm=bpm,
-                                     fade_out=fade_out, target_lufs=target_lufs, soundfont=soundfont)
-    write_audio(path, audio)
-    result = {**plan.summary(), "path": path, "format": format, "mime": MIME[format],
-              "lufs": None if lufs is None else round(lufs, 1), "samples": int(len(audio)),
-              "sample_rate": SR, "cached": False}
-    if midi:
-        result["midi_path"] = export_midi(plan, mid_path)
-    with open(meta_path, "w") as f:
-        json.dump(result, f, indent=1)
-    return result
+        audio, plan, lufs, gain = render_music(mood, duration, loop=loop, seed=seed, key=key, mode=mode, bpm=bpm,
+                                               fade_out=fade_out, target_lufs=target_lufs, soundfont=soundfont,
+                                               intensity=intensity, split=stems)
+        write_audio(path, audio)
+        n_samples = int(len(audio))
+        del audio
+        outputs = {"main": path}
+        stem_paths = {}
+        if stems:
+            for name, sp in stem_plans(plan).items():
+                a = render_audio(sp, soundfont)
+                a *= np.float32(gain)
+                stem_paths[name] = write_audio(_stem_path(path, name), a)
+                del a
+            outputs.update({f"stem-{k}": v for k, v in stem_paths.items()})
+        result = {**plan.summary(), "path": path, "format": format, "mime": MIME[format],
+                  "lufs": None if lufs is None else round(lufs, 1), "samples": n_samples,
+                  "sample_rate": SR, "cached": False, "meta_path": meta_path, "cues": track_cues(plan)}
+        if stem_paths:
+            result["stems"] = stem_paths
+        if midi:
+            result["midi_path"] = outputs["midi"] = export_midi(plan, mid_path)
+        request = {k: v for k, v in params.items() if k != "sf"}
+        result["provenance"] = provenance.build("track", request, seed, sf_path, outputs)
+        write_json(meta_path, result)  # written last: its presence marks a complete cache entry
+        return result
 
 
 def stream_bgm(mood: str, duration: float, *, seed=None, key=None, mode=None, bpm=None,
-               target_lufs: float = -20.0, fade_out: float = 3.0, soundfont=None):
+               target_lufs: float = -20.0, fade_out: float = 3.0, soundfont=None, intensity=None):
     """-> (plan, content_length, iterator of WAV bytes).  Non-loop; static per-mood gain (no look-ahead)."""
+    check_ranges(target_lufs=target_lufs, fade_out=fade_out, bpm=bpm)
     plan = compose(mood, duration, loop=False, seed=_new_seed(seed), key=key, mode=mode, bpm=bpm,
-                   fade_out=fade_out)
+                   fade_out=fade_out, intensity=intensity)
     length, it = stream_wav(plan, gain_db=target_lufs - get_cal(plan.mood, soundfont), soundfont=soundfont)
     return plan, length, it
 
 
 def _validate_scenes(scenes) -> list:
-    if not scenes:
+    if not isinstance(scenes, (list, tuple)) or not scenes:
         raise ValueError("scenes must be a non-empty list of {mood, duration}")
     out = []
     for i, sc in enumerate(scenes):
         if not isinstance(sc, dict) or "mood" not in sc or "duration" not in sc:
             raise ValueError(f"scene {i + 1}: needs 'mood' and 'duration'")
-        d = float(sc["duration"])
+        try:
+            d = float(sc["duration"])
+        except (TypeError, ValueError):
+            raise ValueError(f"scene {i + 1}: duration must be a number, got {sc['duration']!r}") from None
+        check_ranges(bpm=sc.get("bpm"))
         if d < MIN_SECONDS:
             raise ValueError(f"scene {i + 1}: duration must be at least {MIN_SECONDS}s")
         resolve_mood(sc["mood"])
-        out.append({**sc, "duration": d})
+        try:
+            inten = parse_intensity(sc.get("intensity"))
+        except ValueError as e:
+            raise ValueError(f"scene {i + 1}: {e}") from None
+        item = {**sc, "duration": d}
+        if inten is None:
+            item.pop("intensity", None)
+        else:
+            item["intensity"] = inten
+        out.append(item)
     return out
 
 
@@ -146,11 +260,24 @@ def plan_tempos(items: list, max_jump: float) -> list:
     return [cands[i][path[i]][0] for i in range(len(cands))]
 
 
-def _resolve_transition(name: str, prev_mood: str, mood: str) -> str:
+def _mean(curve) -> float:
+    return sum(curve) / len(curve)
+
+
+def scene_energy(scene: dict) -> float:
+    """Mood energy (0-4), shifted by the scene's intensity if it has one (0.5 = no shift, 0/1 = -2/+2)."""
+    e = float(ENERGY[resolve_mood(scene["mood"])[0]])
+    if scene.get("intensity") is not None:
+        e += 4.0 * (_mean(scene["intensity"]) - 0.5)
+    return e
+
+
+def _resolve_transition(name: str, prev_scene: dict, scene: dict) -> str:
     if name != "auto":
         return name
-    delta = ENERGY[resolve_mood(mood)[0]] - ENERGY[resolve_mood(prev_mood)[0]]
-    return "riser_impact" if delta >= 2 else "riser" if delta == 1 else "swell" if delta == 0 else "downlifter"
+    delta = scene_energy(scene) - scene_energy(prev_scene)
+    return ("riser_impact" if delta >= 1.5 else "riser" if delta >= 0.5 else "swell" if delta > -0.5
+            else "downlifter")
 
 
 def render_sequence(scenes: list, *, xfade: float = 2.0, seed: int | None = None, key: str | None = None,
@@ -166,6 +293,19 @@ def render_sequence(scenes: list, *, xfade: float = 2.0, seed: int | None = None
                   own "transition" key overrides the cut *into* that scene).  auto = by mood energy change.
     fx_level_db   transition loudness relative to the surrounding music.
     -> (audio, [per-scene summary], LUFS, key)"""
+    parts = _sequence_parts(scenes, xfade=xfade, seed=seed, key=key, target_lufs=target_lufs, last_fade=last_fade,
+                            soundfont=soundfont, tempo_match=tempo_match, max_bpm_jump=max_bpm_jump,
+                            transitions=transitions, fx_level_db=fx_level_db)
+    out, lufs = normalize_lufs(parts["music"], target_lufs)
+    return out, parts["summaries"], lufs, parts["key"]
+
+
+def _sequence_parts(scenes: list, *, xfade, seed, key, target_lufs, last_fade, soundfont, tempo_match,
+                    max_bpm_jump, transitions, fx_level_db, separate_fx: bool = False, split: bool = False) -> dict:
+    """The work behind render_sequence, before the final loudness gain.
+
+    -> {"music": scenes (+ transitions unless separate_fx), "fx": transitions or None, "summaries", "key",
+        "cues": cue sheet, and what sequence_stems() needs to rebuild any instrument group on the same timeline}"""
     scenes = _validate_scenes(scenes)
     for name in [transitions] + [sc.get("transition") for sc in scenes]:
         if name is not None and name not in TRANSITIONS:
@@ -189,23 +329,28 @@ def render_sequence(scenes: list, *, xfade: float = 2.0, seed: int | None = None
     fin = np.sin(np.linspace(0, np.pi / 2, xs, dtype=np.float32))[:, None] if xs > 1 else None
     fout = np.cos(np.linspace(0, np.pi / 2, xs, dtype=np.float32))[:, None] if xs > 1 else None
     out = np.zeros((total_n, 2), dtype=np.float32)
-    summaries, offsets, pos = [], [], 0.0
+    fx = np.zeros_like(out) if separate_fx else None
+    summaries, offsets, plans, gains, cue_parts, pos = [], [], [], [], [], 0.0
     for i, sc in enumerate(scenes):
         last = i == n - 1
         plan = compose(sc["mood"], render_d[i], loop=False,
                        seed=sc["seed"] if sc.get("seed") is not None else base + i * 7919, key=key,
                        mode=sc.get("mode"), bpm=sc.get("bpm") or targets[i], fade_out=last_fade if last else 0.0,
-                       open_end=not last)
-        audio, _ = normalize_lufs(render_audio(plan, soundfont), target_lufs)
-        if fin is not None:
-            if i > 0:
-                audio[:xs] *= fin
-            if not last:
-                audio[-xs:] *= fout
+                       open_end=not last, intensity=sc.get("intensity"))
+        raw = render_split(plan, soundfont) if split else render_audio(plan, soundfont)
+        g, lufs_s = loudness_gain(raw, target_lufs)
+        audio = raw if lufs_s is None else (raw * g).astype(np.float32)
+        del raw
+        if sc.get("intensity") is not None:  # scenes are levelled individually; intensity sets them apart again
+            k = np.float32(10 ** (INTENSITY_SPAN_DB * (_mean(sc["intensity"]) - 0.5) / 20.0))
+            audio *= k
+            g *= float(k)
+        _place(out, audio, int(round(pos * SR)), i, n, fin, fout, xs)
         off = int(round(pos * SR))
         offsets.append(off)
-        seg = audio[:max(0, total_n - off)]
-        out[off:off + len(seg)] += seg
+        plans.append(plan)
+        gains.append(g)
+        cue_parts.append(plan_cues(plan, offset=pos, length=sc["duration"], scene=i + 1))
         info = {**plan.summary(), "scene": i + 1, "start": round(pos, 3), "duration": sc["duration"],
                 "transition_in": None}
         if i > 0:
@@ -216,46 +361,116 @@ def render_sequence(scenes: list, *, xfade: float = 2.0, seed: int | None = None
                                          f"{max_bpm_jump} BPM at these scene lengths")
         summaries.append(info)
         pos += sc["duration"]
+    swells, cue_tr = [], []
     for i in range(1, n):
-        name = _resolve_transition(scenes[i].get("transition") or transitions, scenes[i - 1]["mood"], scenes[i]["mood"])
+        name = _resolve_transition(scenes[i].get("transition") or transitions, scenes[i - 1], scenes[i])
         summaries[i]["transition_in"] = name
         if name != "none":
             apply_transition(out, name, offsets[i], SR, seed=base + i * 131, key_pc=key_pc, level_db=fx_level_db,
-                             prev_len=scenes[i - 1]["duration"], next_len=scenes[i]["duration"])
-    out, lufs = normalize_lufs(out, target_lufs)
-    return out, summaries, lufs, key
+                             prev_len=scenes[i - 1]["duration"], next_len=scenes[i]["duration"], fx_out=fx)
+            cue_tr.append({"time": round(offsets[i] / SR, 4), "type": name, "scene": i + 1})
+            if name == "swell":
+                swells.append(offsets[i])
+    return {"music": out, "fx": fx, "summaries": summaries, "key": key, "plans": plans, "gains": gains,
+            "offsets": offsets, "swells": swells, "total_n": total_n, "xs": xs, "fin": fin, "fout": fout,
+            "cues": merge_cues(cue_parts, total_n / SR, cue_tr)}
+
+
+def _place(out, audio, off, i, n, fin, fout, xs) -> None:
+    """Crossfade a scene's audio and add it at sample `off` (in place on `audio` and `out`)."""
+    if fin is not None:
+        if i > 0:
+            audio[:xs] *= fin
+        if i < n - 1:
+            audio[-xs:] *= fout
+    seg = audio[:max(0, len(out) - off)]
+    out[off:off + len(seg)] += seg
+
+
+def sequence_stems(parts: dict, soundfont: str | None, gain: float):
+    """Yield (stem name, audio) for each instrument group, on the sequence timeline, already scaled by `gain` so
+    the stems plus the fx stem add up to the delivered file.  One full-length buffer at a time."""
+    names = []
+    for plan in parts["plans"]:
+        names += [k for k in stem_plans(plan) if k not in names]
+    n = len(parts["plans"])
+    for name in names:
+        buf = np.zeros((parts["total_n"], 2), dtype=np.float32)
+        for i, plan in enumerate(parts["plans"]):
+            sp = stem_plans(plan).get(name)
+            if sp is None:
+                continue
+            a = render_audio(sp, soundfont)
+            a *= np.float32(parts["gains"][i])
+            _place(buf, a, parts["offsets"][i], i, n, parts["fin"], parts["fout"], parts["xs"])
+        for cut in parts["swells"]:
+            buf *= swell_curve(len(buf), cut, SR)[:, None]
+        buf *= np.float32(gain)
+        yield name, buf
+        del buf
 
 
 def generate_sequence(scenes: list, *, xfade: float = 2.0, seed: int | None = None, key: str | None = None,
                       format: str = "wav", target_lufs: float = -20.0, fade_out: float = 3.0,
                       soundfont: str | None = None, out_dir: str | None = None, tempo_match: bool = True,
-                      max_bpm_jump: float = 6.0, transitions: str = "none", fx_level_db: float = -3.0) -> dict:
-    """Per-scene background music as a single file (see render_sequence)."""
+                      max_bpm_jump: float = 6.0, transitions: str = "none", fx_level_db: float = -3.0,
+                      stems: bool = False) -> dict:
+    """Per-scene background music as a single file (see render_sequence).
+    stems=True also writes one file per instrument group plus "fx" (the transitions); the main file is built from
+    them, so they add up to it exactly (and it is its own cache entry; see render_split)."""
     format = format.lower().lstrip(".")
-    scenes = _validate_scenes(scenes)
+    if format not in MIME:
+        raise ValueError(f"format must be one of {', '.join(MIME)}")
+    check_ranges(xfade=xfade, target_lufs=target_lufs, fade_out=fade_out, max_bpm_jump=max_bpm_jump,
+                 fx_level_db=fx_level_db)
+    scenes = [{**s, "mood": resolve_mood(s["mood"])[0]} for s in _validate_scenes(scenes)]
+    _check_stems(stems, sum(s["duration"] for s in scenes))
     seed = _new_seed(seed)
     sf_path = find_soundfont(soundfont)
     params = dict(scenes=scenes, xfade=xfade, seed=seed, key=key, fmt=format, lufs=target_lufs, fade=fade_out,
                   tm=tempo_match, jump=max_bpm_jump, tr=transitions, fx=fx_level_db,
                   sf=f"{os.path.basename(sf_path)}:{os.path.getsize(sf_path)}")
+    if stems:
+        params["stems"] = True
     h = hashlib.sha1(json.dumps(params, sort_keys=True, default=str).encode()).hexdigest()[:12]
     d = _out_dir(out_dir)
     stem = f"seq_{len(scenes)}scenes_{int(sum(s['duration'] for s in scenes))}s_{seed}_{h}"
     path, meta_path = os.path.join(d, f"{stem}.{format}"), os.path.join(d, f"{stem}.json")
-    if os.path.isfile(path) and os.path.isfile(meta_path):
-        with open(meta_path) as f:
-            return {**json.load(f), "cached": True}
-    audio, summaries, lufs, key = render_sequence(scenes, xfade=xfade, seed=seed, key=key, target_lufs=target_lufs,
-                                                  last_fade=fade_out, soundfont=soundfont, tempo_match=tempo_match,
-                                                  max_bpm_jump=max_bpm_jump, transitions=transitions,
-                                                  fx_level_db=fx_level_db)
-    write_audio(path, audio)
-    result = {"path": path, "format": format, "mime": MIME[format], "seed": seed, "key": key, "xfade": xfade,
-              "duration": round(len(audio) / SR, 3), "samples": int(len(audio)), "sample_rate": SR,
-              "lufs": None if lufs is None else round(lufs, 1), "scenes": summaries, "cached": False}
-    with open(meta_path, "w") as f:
-        json.dump(result, f, indent=1)
-    return result
+    with _render_lock(path):
+        if os.path.isfile(path) and os.path.isfile(meta_path):
+            with open(meta_path) as f:
+                meta = json.load(f)
+            if _meta_complete(meta, stems=stems):
+                return {**meta, "cached": True}
+        parts = _sequence_parts(scenes, xfade=xfade, seed=seed, key=key, target_lufs=target_lufs,
+                                last_fade=fade_out, soundfont=soundfont, tempo_match=tempo_match,
+                                max_bpm_jump=max_bpm_jump, transitions=transitions, fx_level_db=fx_level_db,
+                                separate_fx=stems, split=stems)
+        mix = parts["music"] if parts["fx"] is None else parts["music"] + parts["fx"]
+        gain, lufs = loudness_gain(mix, target_lufs)
+        audio = mix if lufs is None else (mix * gain).astype(np.float32)
+        write_audio(path, audio)
+        n_samples = int(len(audio))
+        del audio, mix
+        outputs, stem_paths = {"main": path}, {}
+        if stems:
+            parts["music"] = None  # free it before the stem passes
+            for name, buf in sequence_stems(parts, soundfont, gain):
+                stem_paths[name] = write_audio(_stem_path(path, name), buf)
+            fxa = parts["fx"]
+            fxa *= np.float32(gain)
+            stem_paths["fx"] = write_audio(_stem_path(path, "fx"), fxa)
+            outputs.update({f"stem-{k}": v for k, v in stem_paths.items()})
+        result = {"path": path, "format": format, "mime": MIME[format], "seed": seed, "key": parts["key"],
+                  "xfade": xfade, "duration": round(n_samples / SR, 3), "samples": n_samples, "sample_rate": SR,
+                  "lufs": None if lufs is None else round(lufs, 1), "scenes": parts["summaries"], "cached": False,
+                  "meta_path": meta_path, "cues": parts["cues"]}
+        if stem_paths:
+            result["stems"] = stem_paths
+        request = {k: v for k, v in params.items() if k != "sf"}
+        result["provenance"] = provenance.build("sequence", request, seed, sf_path, outputs)
+        write_json(meta_path, result)
+        return result
 
 
 def mix_with_narration(narration_path: str, mood: str = "calm", *, lead_in: float = 1.5, tail_out: float = 3.0,
@@ -264,17 +479,30 @@ def mix_with_narration(narration_path: str, mood: str = "calm", *, lead_in: floa
                        mode: str | None = None, bpm: float | None = None, format: str = "wav",
                        soundfont: str | None = None, out_dir: str | None = None,
                        scenes: list | None = None, xfade: float = 2.0, tempo_match: bool = True,
-                       max_bpm_jump: float = 6.0, transitions: str = "none", fx_level_db: float = -3.0) -> dict:
+                       max_bpm_jump: float = 6.0, transitions: str = "none", fx_level_db: float = -3.0,
+                       intensity=None, stems: bool = False) -> dict:
     """Score a narration track: music is generated to fit it exactly, ducks under speech, fades after it.
 
     scenes=[{"mood":..., "duration":...}, ...] gives per-scene music; durations should add up to the narration
     length (within 1.5 s; the last scene absorbs the difference).  lead_in is added to the first scene and
-    tail_out to the last."""
+    tail_out to the last.
+    stems=True also writes voice / music / fx files (ducked, aligned) that add up to the mix.
+    The result has "cues" (in mix time, with the narration's start and end) and "provenance"; both are also
+    saved next to the mix as <file>.json ("meta_path")."""
     format = format.lower().lstrip(".")
+    if format not in MIME:
+        raise ValueError(f"format must be one of {', '.join(MIME)}")
+    check_ranges(lead_in=lead_in, tail_out=tail_out, voice_lufs=voice_lufs, music_lufs=music_lufs,
+                 duck_db=duck_db, final_lufs=final_lufs, bpm=bpm, xfade=xfade, max_bpm_jump=max_bpm_jump,
+                 fx_level_db=fx_level_db)
+    intensity = parse_intensity(intensity)
+    sf_path = find_soundfont(soundfont)
     voice = read_audio(narration_path)
     narr_s = len(voice) / SR
     total = lead_in + narr_s + tail_out
+    _check_stems(stems, total)
     seed = _new_seed(seed)
+    fx = None
     if scenes:
         scenes = [dict(s) for s in _validate_scenes(scenes)]
         diff = narr_s - sum(s["duration"] for s in scenes)
@@ -283,22 +511,57 @@ def mix_with_narration(narration_path: str, mood: str = "calm", *, lead_in: floa
                              f"narration is {narr_s:.1f}s; they should match within 1.5s")
         scenes[0]["duration"] += lead_in
         scenes[-1]["duration"] += tail_out + diff
-        music, summaries, _, key = render_sequence(scenes, xfade=xfade, seed=seed, key=key,
-                                                   last_fade=max(tail_out, 2.0), soundfont=soundfont,
-                                                   tempo_match=tempo_match, max_bpm_jump=max_bpm_jump,
-                                                   transitions=transitions, fx_level_db=fx_level_db)
-        info = {"mood": "scenes", "seed": seed, "key": key, "scenes": summaries}
+        parts = _sequence_parts(scenes, xfade=xfade, seed=seed, key=key, target_lufs=-20.0,
+                                last_fade=max(tail_out, 2.0), soundfont=soundfont, tempo_match=tempo_match,
+                                max_bpm_jump=max_bpm_jump, transitions=transitions, fx_level_db=fx_level_db,
+                                separate_fx=stems)
+        bed = parts["music"] if parts["fx"] is None else parts["music"] + parts["fx"]
+        g_seq, _ = loudness_gain(bed, -20.0)  # same levelling render_sequence applies
+        del bed
+        music = (parts["music"] * g_seq).astype(np.float32)
+        if parts["fx"] is not None:
+            fx = (parts["fx"] * g_seq).astype(np.float32)
+        key = parts["key"]
+        info = {"mood": "scenes", "seed": seed, "key": key, "scenes": parts["summaries"]}
+        cues = parts["cues"]
     else:
-        plan = compose(mood, total, loop=False, seed=seed, key=key, mode=mode, bpm=bpm, fade_out=max(tail_out, 2.0))
+        plan = compose(mood, total, loop=False, seed=seed, key=key, mode=mode, bpm=bpm, fade_out=max(tail_out, 2.0),
+                       intensity=intensity)
         music = render_audio(plan, soundfont)
         info = plan.summary()
-    mixed, stats = mix_voice_and_music(voice, music, lead_in=lead_in, tail_out=tail_out, voice_lufs=voice_lufs,
-                                       music_lufs=music_lufs, duck_db=duck_db, final_lufs=final_lufs)
+        cues = track_cues(plan)
+    mixed, stats, stem_audio = mix_voice_and_music(voice, music, lead_in=lead_in, tail_out=tail_out,
+                                                   voice_lufs=voice_lufs, music_lufs=music_lufs, duck_db=duck_db,
+                                                   final_lufs=final_lufs, fx=fx, stems=stems)
+    del music, fx
     d = _out_dir(out_dir)
     base = os.path.splitext(os.path.basename(narration_path))[0]
-    path = os.path.join(d, f"{base}_scored_{info['mood']}_{seed}.{format}")
+    # the narration's own content is part of the name, so two different narrations never share an output file
+    with open(narration_path, "rb") as f:
+        nh = hashlib.sha1(f.read()).hexdigest()[:8]
+    path = os.path.join(d, f"{base}_scored_{info['mood']}_{seed}_{nh}.{format}")
+    meta_path = os.path.splitext(path)[0] + ".json"
     write_audio(path, mixed)
-    return {**info, "path": path, "format": format, "mime": MIME[format],
-            "narration_seconds": round(narr_s, 2), "lead_in": lead_in, "tail_out": tail_out,
-            "total_seconds": round(len(mixed) / SR, 3),
-            **{k: (None if v is None else round(v, 2)) for k, v in stats.items()}}
+    outputs, stem_paths = {"main": path}, {}
+    for name, a in (stem_audio or {}).items():
+        stem_paths[name] = write_audio(_stem_path(path, name), a)
+    del stem_audio
+    outputs.update({f"stem-{k}": v for k, v in stem_paths.items()})
+    cues = {**cues, "duration": round(len(mixed) / SR, 4),
+            "narration": {"start": round(lead_in, 4), "end": round(lead_in + narr_s, 4)}}
+    request = {"narration": {"file": os.path.basename(narration_path), "sha256": provenance.file_sha256(narration_path),
+                             "seconds": round(narr_s, 3)},
+               "mood": None if scenes else resolve_mood(mood)[0], "scenes": scenes, "lead_in": lead_in,
+               "tail_out": tail_out, "voice_lufs": voice_lufs, "music_lufs": music_lufs, "duck_db": duck_db,
+               "final_lufs": final_lufs, "key": key, "mode": mode, "bpm": bpm, "xfade": xfade,
+               "tempo_match": tempo_match, "max_bpm_jump": max_bpm_jump, "transitions": transitions,
+               "fx_level_db": fx_level_db, "intensity": intensity, "fmt": format}
+    result = {**info, "path": path, "format": format, "mime": MIME[format],
+              "narration_seconds": round(narr_s, 2), "lead_in": lead_in, "tail_out": tail_out,
+              "total_seconds": round(len(mixed) / SR, 3), "meta_path": meta_path, "cues": cues,
+              **{k: (None if v is None else round(v, 2)) for k, v in stats.items()}}
+    if stem_paths:
+        result["stems"] = stem_paths
+    result["provenance"] = provenance.build("mix", request, seed, sf_path, outputs)
+    write_json(meta_path, result)
+    return result

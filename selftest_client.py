@@ -34,6 +34,9 @@ env = {"BGM_OUT_DIR": os.path.join(tmp, "server_out")}
 check("parse_scenes accepts 3 forms",
       parse_scenes("lofi:30,calm:20") == parse_scenes([("lofi", 30), ("calm", 20)]) ==
       parse_scenes([{"mood": "lofi", "duration": 30}, {"mood": "calm", "duration": 20}]))
+check("parse_scenes takes an optional intensity",
+      parse_scenes("horror:30:0.8") == parse_scenes([("horror", 30, 0.8)]) ==
+      [{"mood": "horror", "duration": 30.0, "intensity": 0.8}])
 
 # server down -> clear error, fast
 down = BGMClient("http://127.0.0.1:8799", retries=0, autostart=False)
@@ -49,7 +52,9 @@ except BGMError as e:
 with BGMClient(URL, KEY, project_dir=HERE, server_env=env, timeout=600) as c:
     check("autostart brought the server up", c.is_up())
     check("health ok", c.health()["ok"])
-    check("moods listed", len(c.moods()) == 8)
+    check("moods listed", {"calm", "lofi", "horror", "sleep", "folklore", "suspense"} <= set(c.moods()))
+    r = c.music("creepypasta", 12, os.path.join(tmp, "client_curve.wav"), seed=4, intensity=[0.1, 0.9])
+    check("music() with an intensity curve", os.path.isfile(r["path"]) and r["duration"] == 12.0)
 
     # auth
     try:
@@ -93,6 +98,19 @@ with BGMClient(URL, KEY, project_dir=HERE, server_env=env, timeout=600) as c:
     check("score: final loudness ~ -16 LUFS", abs(r["final_lufs"] + 16) < 1.0, f"({r['final_lufs']})")
     r = c.score(npath, os.path.join(tmp, "scored_scenes.wav"), scenes="lofi:5,tech:9", seed=3, lead_in=0.0, tail_out=2.0)
     check("score with scenes", abs(dur(r["path"]) - 16.0) < 0.01, f"({dur(r['path']):.2f}s)")
+    check("score: cues place the narration", r["cues"]["narration"] == {"start": 0.0, "end": 14.0},
+          str(r["cues"].get("narration")))
+    r = c.score(npath, os.path.join(tmp, "scored_stems.wav"), scenes="calm:7,cinematic:7", transitions="riser_impact",
+                seed=3, stems=True)
+    check("score stems downloaded beside the mix", set(r["stems"]) == {"voice", "music", "fx"} and
+          all(os.path.isfile(p) for p in r["stems"].values()), str(r["stems"]))
+    r = c.music("folklore", 10, os.path.join(tmp, "folk.wav"), seed=2, stems=True)
+    with open(r["meta_path"]) as f:
+        rec = json.load(f)
+    check("music: record saved beside the audio", r["meta_path"] == os.path.join(tmp, "folk.json") and
+          rec["provenance"]["outputs"]["main"]["file"] and rec["local_path"] == os.path.abspath(r["path"]))
+    check("music: stems downloaded", len(r["stems"]) >= 4 and all(os.path.isfile(p) for p in r["stems"].values()))
+    check("music: cues returned", r["cues"]["downbeats"][0] == 0.0 and r["cues"]["sections"])
 
     # readable errors from the server
     for label, fn, needle in [

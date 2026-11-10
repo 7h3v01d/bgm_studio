@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (GitHub: 7h3v01d)
 """Command line:  python -m bgmstudio.cli {moods,generate,mix,serve}"""
 from __future__ import annotations
 
@@ -8,8 +10,17 @@ import json
 def _parse_scenes(text: str) -> list:
     out = []
     for part in text.split(","):
-        mood, _, dur = part.strip().partition(":")
-        out.append({"mood": mood, "duration": float(dur)})
+        fields = part.strip().split(":")
+        try:
+            if len(fields) not in (2, 3):
+                raise ValueError
+            sc = {"mood": fields[0], "duration": float(fields[1])}
+            if len(fields) == 3:
+                sc["intensity"] = float(fields[2])
+        except ValueError:
+            raise SystemExit(f"bad scene {part.strip()!r}: use mood:seconds or mood:seconds:intensity, "
+                             "e.g. lofi:30,cinematic:45:0.8") from None
+        out.append(sc)
     return out
 
 
@@ -32,9 +43,11 @@ def main(argv=None):
     g.add_argument("--format", default="wav")
     g.add_argument("--lufs", type=float, default=-20.0)
     g.add_argument("--midi", action="store_true")
+    g.add_argument("--stems", action="store_true", help="also write per-part files that add up to the main file")
+    g.add_argument("--intensity", help="0..1, or a comma-separated tension curve e.g. 0.2,0.4,0.9,0.3")
 
     q = sub.add_parser("sequence", help="per-scene music, e.g.  sequence lofi:30,cinematic:45,dark:20")
-    q.add_argument("scenes", help="comma-separated mood:seconds")
+    q.add_argument("scenes", help="comma-separated mood:seconds[:intensity], e.g. sleep:60:0.1,horror:45:0.8")
     q.add_argument("-o", "--out-dir")
     q.add_argument("--xfade", type=float, default=2.0)
     q.add_argument("--seed", type=int)
@@ -44,6 +57,7 @@ def main(argv=None):
     q.add_argument("--no-tempo-match", action="store_true", help="don't bring neighbouring scenes to similar tempos")
     q.add_argument("--max-bpm-jump", type=float, default=6.0)
     q.add_argument("--fx-level-db", type=float, default=-3.0)
+    q.add_argument("--stems", action="store_true", help="also write per-part files that add up to the main file")
 
     m = sub.add_parser("mix", help="score a narration file")
     m.add_argument("narration")
@@ -53,12 +67,15 @@ def main(argv=None):
     m.add_argument("--format", default="wav")
     m.add_argument("--music-lufs", type=float, default=-26.0)
     m.add_argument("--duck-db", type=float, default=9.0)
+    m.add_argument("--stems", action="store_true", help="also write per-part files that add up to the main file")
+    m.add_argument("--intensity", help="0..1, or a comma-separated tension curve e.g. 0.2,0.4,0.9,0.3")
 
     m.add_argument("--transitions", default="none", help="none|riser|impact|riser_impact|downlifter|swell|auto")
     m.add_argument("--no-tempo-match", action="store_true", help="don't bring neighbouring scenes to similar tempos")
     m.add_argument("--max-bpm-jump", type=float, default=6.0)
     m.add_argument("--fx-level-db", type=float, default=-3.0)
-    m.add_argument("--scenes", help="per-scene moods, comma-separated mood:seconds (must sum to the narration length)")
+    m.add_argument("--scenes", help="per-scene moods, comma-separated mood:seconds[:intensity] "
+                                    "(must sum to the narration length)")
 
     s = sub.add_parser("serve", help="run the REST API")
     s.add_argument("--host", default="127.0.0.1")
@@ -66,6 +83,13 @@ def main(argv=None):
 
     a = ap.parse_args(argv)
     from . import service
+    try:
+        _run(a, service)
+    except (ValueError, FileNotFoundError, RuntimeError) as e:
+        raise SystemExit(f"error: {e}") from None
+
+
+def _run(a, service):
     if a.cmd == "moods":
         for k, v in service.moods().items():
             print(f"{k:10s} {v}")
@@ -74,19 +98,22 @@ def main(argv=None):
         print(json.dumps(calibrate_all(), indent=1))
     elif a.cmd == "generate":
         r = service.generate_bgm(a.mood, a.duration, loop=a.loop, seed=a.seed, key=a.key, mode=a.mode, bpm=a.bpm,
-                                 format=a.format, target_lufs=a.lufs, out_dir=a.out_dir, midi=a.midi)
+                                 format=a.format, target_lufs=a.lufs, out_dir=a.out_dir, midi=a.midi,
+                                 intensity=a.intensity, stems=a.stems)
         print(json.dumps(r, indent=1))
     elif a.cmd == "sequence":
         r = service.generate_sequence(_parse_scenes(a.scenes), xfade=a.xfade, seed=a.seed, key=a.key,
                                       format=a.format, out_dir=a.out_dir, tempo_match=not a.no_tempo_match,
-                                      max_bpm_jump=a.max_bpm_jump, transitions=a.transitions, fx_level_db=a.fx_level_db)
+                                      max_bpm_jump=a.max_bpm_jump, transitions=a.transitions, fx_level_db=a.fx_level_db,
+                                      stems=a.stems)
         print(json.dumps(r, indent=1))
     elif a.cmd == "mix":
         r = service.mix_with_narration(a.narration, a.mood, seed=a.seed, format=a.format, out_dir=a.out_dir,
                                        music_lufs=a.music_lufs, duck_db=a.duck_db,
                                        scenes=_parse_scenes(a.scenes) if a.scenes else None,
                                        tempo_match=not a.no_tempo_match, max_bpm_jump=a.max_bpm_jump,
-                                       transitions=a.transitions, fx_level_db=a.fx_level_db)
+                                       transitions=a.transitions, fx_level_db=a.fx_level_db,
+                                       intensity=a.intensity, stems=a.stems)
         print(json.dumps(r, indent=1))
     elif a.cmd == "serve":
         import uvicorn

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (GitHub: 7h3v01d)
 """Plan -> audio, using FluidSynth driven sample-accurately from Python.
 
 Seamless loops: the plan guarantees every note ends on or before the last bar
@@ -14,7 +16,18 @@ from typing import Iterator
 
 import numpy as np
 
-from .compose import Plan
+import dataclasses
+
+from .compose import CH_BASS, CH_DRUM, CH_KEYS, CH_MEL, CH_PAD, CH_SPARK, Plan
+
+# Instrument stems: name -> MIDI channels.
+# FluidSynth reuses voice slots, and a reused voice carries a little state from the note it played before into the
+# first moments of the next one.  So a full render and the sum of per-group renders differ slightly at note attacks
+# (measured up to ~20 dB under the music in a 50 ms window on drum-heavy moods).  For exact stems the mix is
+# therefore *built from* the group renders (render_split); each group render is deterministic, so rendering a group
+# again later gives the identical audio.
+STEM_GROUPS = {"pad": (CH_PAD,), "bass": (CH_BASS,), "keys": (CH_KEYS,), "melody": (CH_MEL,),
+               "sparkle": (CH_SPARK,), "drums": (CH_DRUM,)}
 
 SR = 44100
 SYNTH_GAIN = 0.6
@@ -130,6 +143,38 @@ def _iter_audio(plan: Plan, fs, sr: int, tail_samples: int) -> Iterator[np.ndarr
         yield _gen(fs, target - cur)
 
 
+def section_envelope(plan: Plan, sr: int = SR):
+    """Gain envelope from plan.section_db (intensity), or None.  -> f(start_sample, n) -> float32 gains.
+
+    Each section holds its level; the change ramps over the bar *before* the boundary so the new level lands on
+    the downbeat.  Loops ramp back to the first section's level in the final bar, so the seam stays seamless
+    (samples past the end - the folded loop tail - use the first section's level, matching where they land)."""
+    if not plan.section_db or all(abs(d) < 1e-9 for d in plan.section_db):
+        return None
+    spb = 60.0 / plan.bpm
+    total = plan.duration * sr
+    bar = 4 * spb * sr
+    xs, ys = [0.0], [plan.section_db[0]]
+    for (_, start_bar, _), prev_db, db in zip(plan.sections[1:], plan.section_db, plan.section_db[1:]):
+        t = start_bar * 4 * spb * sr
+        xs += [max(xs[-1], t - bar), t]
+        ys += [prev_db, db]
+    if plan.loop:
+        xs += [max(xs[-1], total - bar), total]
+        ys += [plan.section_db[-1], plan.section_db[0]]
+    xp, fp = np.asarray(xs), 10 ** (np.asarray(ys) / 20.0)
+
+    def env(start: int, n: int) -> np.ndarray:
+        return np.interp(np.arange(start, start + n, dtype=np.float64), xp, fp).astype(np.float32)
+    return env
+
+
+def _apply_envelope(audio: np.ndarray, env, chunk: int = 1 << 20) -> None:
+    for i in range(0, len(audio), chunk):
+        blk = audio[i:i + chunk]
+        blk *= env(i, len(blk))[:, None]
+
+
 def _fade_curve(n: int) -> np.ndarray:
     x = np.linspace(0.0, 1.0, n, endpoint=True, dtype=np.float32)
     return 0.5 * (1.0 + np.cos(np.pi * x))
@@ -145,6 +190,9 @@ def render_audio(plan: Plan, soundfont: str | None = None, sr: int = SR) -> np.n
         audio = np.concatenate(list(_iter_audio(plan, fs, sr, tail)), axis=0)
     finally:
         fs.delete()
+    env = section_envelope(plan, sr)
+    if env is not None:
+        _apply_envelope(audio, env)
     main, post = audio[:total].copy(), audio[total:]
     if plan.loop:
         pos = 0
@@ -157,6 +205,30 @@ def render_audio(plan: Plan, soundfont: str | None = None, sr: int = SR) -> np.n
         if n > 1:
             main[-n:] *= _fade_curve(n)[:, None]
     return main
+
+
+def render_split(plan: Plan, soundfont: str | None = None, sr: int = SR) -> np.ndarray:
+    """The mix as the sum of separately rendered instrument groups (see STEM_GROUPS): what stems add up to."""
+    total = None
+    for sp in stem_plans(plan).values():
+        a = render_audio(sp, soundfont, sr)
+        if total is None:
+            total = a
+        else:
+            total += a
+    if total is None:  # no notes at all
+        return np.zeros((int(round(plan.duration * sr)), 2), dtype=np.float32)
+    return total
+
+
+def stem_plans(plan: Plan) -> dict:
+    """-> {stem name: plan holding only that group's notes}, skipping groups with no notes."""
+    out = {}
+    for name, chans in STEM_GROUPS.items():
+        notes = [n for n in plan.notes if n.ch in chans]
+        if notes:
+            out[name] = dataclasses.replace(plan, notes=notes)
+    return out
 
 
 def stream_wav(plan: Plan, gain_db: float = 0.0, soundfont: str | None = None,
@@ -175,6 +247,7 @@ def stream_wav(plan: Plan, gain_db: float = 0.0, soundfont: str | None = None,
     gain = 10 ** (gain_db / 20.0)
     fade_n = int(min(plan.fade_out, plan.duration * 0.3) * sr)
     fade = _fade_curve(fade_n) if fade_n > 1 else None
+    env = section_envelope(plan, sr)
 
     def gen() -> Iterator[bytes]:
         yield header
@@ -188,19 +261,21 @@ def stream_wav(plan: Plan, gain_db: float = 0.0, soundfont: str | None = None,
                     continue
                 out = np.concatenate(buf, axis=0)
                 buf, buffered = [], 0
-                yield _to_pcm(out, pos, total, gain, fade, fade_n)
+                yield _to_pcm(out, pos, total, gain, fade, fade_n, env)
                 pos += len(out)
             if buf:
                 out = np.concatenate(buf, axis=0)
-                yield _to_pcm(out, pos, total, gain, fade, fade_n)
+                yield _to_pcm(out, pos, total, gain, fade, fade_n, env)
         finally:
             fs.delete()
 
     return len(header) + data_len, gen()
 
 
-def _to_pcm(block, pos, total, gain, fade, fade_n) -> bytes:
+def _to_pcm(block, pos, total, gain, fade, fade_n, env=None) -> bytes:
     block = block * gain
+    if env is not None:
+        block *= env(pos, len(block))[:, None]
     if fade is not None:
         start_fade = total - fade_n
         lo = max(pos, start_fade)

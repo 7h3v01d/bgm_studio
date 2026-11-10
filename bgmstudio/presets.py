@@ -1,7 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (GitHub: 7h3v01d)
 """Musical building blocks and mood presets.
 
 Everything the composer knows about style lives here, so adding a mood is a
 data change, not a code change.  GM program numbers are 0-based.
+
+Optional preset keys (all default to "off", so older presets render exactly as before):
+  drone        True -> a held low root+fifth pedal on the bass channel through every section, under the
+               changing chords (horror dread, sleep-story bed).  Replaces the bass line.
+  dissonance   0..1 chance per chord of adding a clashing tone (minor 2nd / tritone) to the pad.
+  max_level    0..4 cap on how busy a section may get (see LEVEL_LAYERS); sleep never reaches full peak.
+  kind_gain    per-section-kind velocity scale, overriding KIND_GAIN (flat = no swells).
+  spark_scale  multiplier on the chance of sparkle notes.
+  melody       False -> no melody layer anywhere (a tune pulls attention; sleep beds shouldn't).
 """
 from __future__ import annotations
 
@@ -12,6 +23,7 @@ SCALES = {
     "lydian":     [0, 2, 4, 6, 7, 9, 11],
     "mixolydian": [0, 2, 4, 5, 7, 9, 10],
     "phrygian":   [0, 1, 3, 5, 7, 8, 10],
+    "harmonic_minor": [0, 2, 3, 5, 7, 8, 11],
 }
 
 # Four-chord progressions as 0-based scale degrees (0 = I/i, 3 = IV/iv, ...).
@@ -22,6 +34,8 @@ PROGS = {
     "minor":      [[0, 5, 2, 6], [0, 6, 5, 6], [0, 3, 6, 2], [5, 2, 6, 0], [0, 2, 5, 6]],
     "dorian":     [[0, 3, 0, 3], [0, 3, 6, 3], [0, 6, 3, 0], [0, 1, 3, 0]],
     "phrygian":   [[0, 1, 0, 1], [0, 1, 6, 0], [0, 5, 1, 0]],
+    # degree 2 is the augmented III+, degree 1 the diminished ii°: gothic / fairy-tale colour
+    "harmonic_minor": [[0, 5, 3, 4], [0, 3, 4, 0], [0, 5, 1, 4], [0, 2, 5, 4]],
 }
 
 # Bass: (step_on_16th_grid, length_in_steps, semitone_offset_from_root)
@@ -59,6 +73,12 @@ DRUM_STYLES = {
                   "color": [(54, [0, 4, 8, 12], 35, 50)], "fill": 45},
     "minimal":   {"core": [(36, [0, 6], 68, 82), (37, [12], 55, 70)],
                   "color": [(42, [4, 10, 14], 30, 48)], "fill": 37},
+    # lub-dub kick pairs: tension that doesn't read as "a beat"
+    "heartbeat": {"core": [(36, [0, 3, 8, 11], 72, 88)],
+                  "color": [(44, [4, 12], 24, 38)], "fill": 47},
+    # frame-drum / bodhran feel on toms, tambourine and shaker
+    "frame":     {"core": [(45, [0, 6, 8], 70, 88), (47, [12], 58, 72)],
+                  "color": [(54, [4, 12], 36, 52), (70, [2, 6, 10, 14], 22, 36)], "fill": 45},
 }
 
 # Layers per section kind.
@@ -71,6 +91,16 @@ LAYERS = {
     "outro": ["pad", "keys_lite", "spark"],
 }
 KIND_GAIN = {"intro": 0.72, "verse": 0.85, "build": 0.92, "peak": 1.0, "break": 0.70, "outro": 0.65}
+
+# Busyness ladder used by `intensity` and `max_level`.  A section's own kind sets its level; intensity shifts it.
+KIND_LEVEL = {"intro": 1, "break": 1, "outro": 1, "verse": 2, "build": 3, "peak": 4}
+LEVEL_LAYERS = {
+    0: ["pad", "bass_whole"],
+    1: ["pad", "keys_lite", "spark"],
+    2: LAYERS["verse"],
+    3: LAYERS["build"],
+    4: LAYERS["peak"],
+}
 
 # Channels: 0 pad, 1 bass, 2 keys, 3 melody, 4 sparkle, 9 drums.
 PRESETS = {
@@ -168,6 +198,56 @@ PRESETS = {
         "mix": {"pad": 80, "bass": 100, "keys": 85, "mel": 75, "spark": 80, "drums": 90},
         "cal": -24.8,
     },
+    # ---------------------------------------------------------------- fiction / storytelling moods
+    "horror": {
+        "desc": "Choir pad over a contrabass drone, music box and distant bells, clashing tones. Horror, creepypasta.",
+        "bpm": (50, 68), "modes": {"phrygian": 3, "minor": 2, "harmonic_minor": 2},
+        "key_pcs": [0, 2, 3, 5, 7, 9, 10], "seventh": False, "bpc": 2,
+        "programs": {"pad": 91, "bass": 43, "keys": 10, "mel": 44, "spark": 14},
+        "drums": None, "bass_patterns": ["whole"], "keys_patterns": ["arp_slow"],
+        "mel_density": "sparse", "mel_in_verse": False, "swing": 0.0,
+        "reverb": (0.95, 0.25, 1.0, 0.8),
+        "mix": {"pad": 95, "bass": 100, "keys": 80, "mel": 80, "spark": 75, "drums": 80},
+        "drone": True, "dissonance": 0.5, "spark_scale": 0.6,
+        "cal": -25.1,
+    },
+    "sleep": {
+        "desc": "Very slow, flat and soft: warm pad, string drone, harp, rare celesta. Sleep stories, bedtime, long-form calm.",
+        "bpm": (44, 56), "modes": {"major": 3, "lydian": 2},
+        "key_pcs": [0, 2, 3, 5, 7, 8, 9, 10], "seventh": True, "bpc": 4,
+        "programs": {"pad": 89, "bass": 49, "keys": 46, "mel": 73, "spark": 8},
+        "drums": None, "bass_patterns": ["whole"], "keys_patterns": ["arp_slow"],
+        "mel_density": "sparse", "mel_in_verse": False, "swing": 0.0,
+        "reverb": (0.95, 0.4, 1.0, 0.75),
+        "mix": {"pad": 100, "bass": 75, "keys": 80, "mel": 70, "spark": 70, "drums": 60},
+        "drone": True, "max_level": 2, "spark_scale": 0.3, "melody": False,
+        "kind_gain": {"intro": 0.75, "verse": 0.78, "build": 0.78, "peak": 0.8, "break": 0.75, "outro": 0.72},
+        "cal": -29.1,
+    },
+    "folklore": {
+        "desc": "Harp arpeggios, flute melody, cello and strings, frame drum. Myths, legends, folk tales.",
+        "bpm": (72, 96), "modes": {"dorian": 3, "mixolydian": 2, "minor": 1, "harmonic_minor": 1},
+        "key_pcs": [0, 2, 4, 5, 7, 9, 10], "seventh": False, "bpc": 1,
+        "programs": {"pad": 48, "bass": 42, "keys": 46, "mel": 73, "spark": 79},
+        "drums": "frame", "bass_patterns": ["root_fifth", "half", "walk"],
+        "keys_patterns": ["arp8", "arp8b", "arp_slow"],
+        "mel_density": "medium", "mel_in_verse": True, "swing": 0.12,
+        "reverb": (0.7, 0.4, 0.9, 0.5),
+        "mix": {"pad": 70, "bass": 95, "keys": 100, "mel": 100, "spark": 75, "drums": 80},
+        "cal": -21.8,
+    },
+    "suspense": {
+        "desc": "Pizzicato ostinato, pulsing synth bass, heartbeat kick, uneasy strings. Thrillers, chases, ticking clocks.",
+        "bpm": (84, 104), "modes": {"minor": 3, "phrygian": 2, "harmonic_minor": 1},
+        "key_pcs": [0, 2, 3, 5, 7, 9, 10], "seventh": False, "bpc": 2,
+        "programs": {"pad": 50, "bass": 38, "keys": 45, "mel": 41, "spark": 11},
+        "drums": "heartbeat", "bass_patterns": ["pulse8", "driving"], "keys_patterns": ["arp16", "arp8"],
+        "mel_density": "sparse", "mel_in_verse": False, "swing": 0.0,
+        "reverb": (0.75, 0.35, 0.9, 0.5),
+        "mix": {"pad": 85, "bass": 100, "keys": 90, "mel": 90, "spark": 70, "drums": 90},
+        "dissonance": 0.25,
+        "cal": -25.4,
+    },
 }
 
 ALIASES = {
@@ -175,8 +255,15 @@ ALIASES = {
     "epic": "cinematic", "documentary": "cinematic", "history": "cinematic",
     "happy": "uplifting", "positive": "uplifting", "motivational": "uplifting",
     "business": "corporate", "presentation": "corporate",
-    "tension": "dark", "suspense": "dark", "mystery": "dark", "true_crime": "dark",
-    "space": "ambient", "sleep": "ambient", "nature": "ambient",
+    "mystery": "dark", "true_crime": "dark",
+    "space": "ambient", "nature": "ambient",
+    "tension": "suspense", "thriller": "suspense", "chase": "suspense",
+    "creepy": "horror", "creepypasta": "horror", "scary": "horror", "spooky": "horror", "haunted": "horror",
+    "dread": "horror",
+    "bedtime": "sleep", "sleep_story": "sleep", "lullaby": "sleep",
+    "folk": "folklore", "myth": "folklore", "mythology": "folklore", "legend": "folklore",
+    "fairytale": "folklore", "fairy_tale": "folklore",
+    "alt_history": "cinematic", "what_if": "cinematic",
     "electronic": "tech", "technology": "tech", "futuristic": "tech",
 }
 
@@ -195,4 +282,5 @@ def describe_moods():
 
 
 # Rough energy ranking (0 = barely there ... 4 = full-on); drives transitions="auto".
-ENERGY = {"ambient": 0, "calm": 1, "lofi": 2, "dark": 3, "corporate": 3, "cinematic": 4, "uplifting": 4, "tech": 4}
+ENERGY = {"ambient": 0, "calm": 1, "lofi": 2, "dark": 3, "corporate": 3, "cinematic": 4, "uplifting": 4, "tech": 4,
+          "sleep": 0, "horror": 1, "folklore": 2, "suspense": 3}

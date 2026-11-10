@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Leon Priest (GitHub: 7h3v01d)
 """Procedural composer: mood + duration + seed  ->  a complete note plan.
 
 Design goals
@@ -10,6 +12,11 @@ Design goals
   * Long-form: sections (intro/verse/build/peak/break/outro) layer instruments in
     and out, and a new "movement" (fresh progressions/patterns) starts every six
     sections so a 30-minute bed doesn't feel like one 30-second loop.
+  * Intensity (optional, 0..1, a single value or a curve across the piece): shifts
+    each section up or down the busyness ladder (LEVEL_LAYERS), scales velocities
+    and sparkle density, picks the tempo within the mood's range, and gives the
+    renderer a per-section level so quiet passages stay quiet after normalisation.
+    intensity=None reproduces earlier releases note-for-note.
 """
 from __future__ import annotations
 
@@ -17,7 +24,7 @@ import math
 import random
 from dataclasses import dataclass, field
 
-from .presets import (BASS_PATTERNS, DRUM_STYLES, KEYS_PATTERNS, KIND_GAIN, LAYERS,
+from .presets import (BASS_PATTERNS, DRUM_STYLES, KEYS_PATTERNS, KIND_GAIN, KIND_LEVEL, LAYERS, LEVEL_LAYERS,
                       PROGS, SCALES, resolve_mood)
 
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
@@ -26,6 +33,38 @@ CH_PAD, CH_BASS, CH_KEYS, CH_MEL, CH_SPARK, CH_DRUM = 0, 1, 2, 3, 4, 9
 MIN_SECONDS, MAX_SECONDS = 4.0, 7200.0
 SECTION_BARS = 8
 MOVEMENT_EVERY = 6  # sections
+INTENSITY_SPAN_DB = 8.0   # level difference between intensity 0 and 1 (relative; final loudness is normalised)
+MAX_CURVE_POINTS = 64
+
+
+def parse_intensity(value):
+    """None | number | list of numbers (or "0.2,0.8" text) -> None or a list of 1..64 floats in [0, 1]."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = [v for v in value.replace(" ", "").split(",") if v]
+    vals = list(value) if isinstance(value, (list, tuple)) else [value]
+    if not 1 <= len(vals) <= MAX_CURVE_POINTS:
+        raise ValueError(f"intensity must be a number or a list of 1-{MAX_CURVE_POINTS} numbers between 0 and 1")
+    out = []
+    for v in vals:
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            raise ValueError(f"intensity values must be numbers between 0 and 1, got {v!r}") from None
+        if not 0.0 <= f <= 1.0 or f != f:
+            raise ValueError(f"intensity values must be between 0 and 1, got {f:g}")
+        out.append(f)
+    return out
+
+
+def curve_at(curve: list, x: float) -> float:
+    """Linear interpolation of evenly spaced curve points over x in [0, 1]."""
+    if len(curve) == 1:
+        return curve[0]
+    pos = min(max(x, 0.0), 1.0) * (len(curve) - 1)
+    i = min(int(pos), len(curve) - 2)
+    return curve[i] + (curve[i + 1] - curve[i]) * (pos - i)
 
 
 @dataclass
@@ -56,15 +95,22 @@ class Plan:
     cal_lufs: float = -22.0
     open_end: bool = False
     beats: float = 0.0
+    intensity: list | None = None      # the curve as given (None = not used)
+    section_intensity: list | None = None  # one value per section
+    section_db: list | None = None     # relative level per section, for the renderer's gain envelope
 
     @property
     def total_beats(self) -> float:
         return self.beats or self.bars * 4.0
 
     def summary(self) -> dict:
-        return {"mood": self.mood, "seed": self.seed, "key": f"{self.key} {self.mode}",
-                "bpm": round(self.bpm, 2), "bars": self.bars, "duration": self.duration,
-                "loop": self.loop, "sections": [s[0] for s in self.sections], "notes": len(self.notes)}
+        out = {"mood": self.mood, "seed": self.seed, "key": f"{self.key} {self.mode}",
+               "bpm": round(self.bpm, 2), "bars": self.bars, "duration": self.duration,
+               "loop": self.loop, "sections": [s[0] for s in self.sections], "notes": len(self.notes)}
+        if self.intensity is not None:
+            out["intensity"] = self.intensity
+            out["section_intensity"] = [round(v, 3) for v in self.section_intensity]
+        return out
 
 
 # ---------------------------------------------------------------- theory helpers
@@ -223,8 +269,9 @@ def _gen_phrase(rng, scale, root_pc, degs, bpc, density):
 # ---------------------------------------------------------------- composer
 def compose(mood: str, duration: float, *, loop: bool = False, seed: int | None = None,
             key: str | None = None, mode: str | None = None, bpm: float | None = None,
-            fade_out: float = 3.0, open_end: bool = False) -> Plan:
+            fade_out: float = 3.0, open_end: bool = False, intensity=None) -> Plan:
     name, P = resolve_mood(mood)
+    curve = parse_intensity(intensity)
     duration = float(duration)
     if not (MIN_SECONDS <= duration <= MAX_SECONDS):
         raise ValueError(f"duration must be between {MIN_SECONDS} and {MAX_SECONDS} seconds")
@@ -237,12 +284,36 @@ def compose(mood: str, duration: float, *, loop: bool = False, seed: int | None 
     scale = SCALES[mode]
     key_pc = parse_key(key) if key else rng.choice(P["key_pcs"])
     root = 48 + key_pc
-    target_bpm = float(bpm) if bpm else rng.uniform(*P["bpm"])
+    target_bpm = float(bpm) if bpm else rng.uniform(*P["bpm"])  # always drawn, so the rng stream is unchanged
+    if curve is not None and not bpm:
+        lo_b, hi_b = P["bpm"]
+        target_bpm = lo_b + (hi_b - lo_b) * (sum(curve) / len(curve))
     bars, bpm_fit, beats = fit_bars(duration, target_bpm, grain=1 if open_end else 4)
     total = float(beats)
     bpc, seventh, swing = P["bpc"], P["seventh"], P["swing"]
     drum_style = DRUM_STYLES.get(P["drums"]) if P["drums"] else None
     sections = plan_sections(bars, loop)
+    if curve is None:
+        sec_int = None
+    else:
+        sec_int = [curve_at(curve, (st + n / 2.0) / bars) for _, st, n in sections]
+    kind_gain = P.get("kind_gain", KIND_GAIN)
+    max_level = P.get("max_level", 4)
+    spark_scale = P.get("spark_scale", 1.0)
+    drone = P.get("drone", False)
+    dissonance = P.get("dissonance", 0.0)
+    rdis = random.Random(f"{seed}:{name}:dissonance")
+
+    def section_layers(kind: str, si: int) -> list:
+        base = KIND_LEVEL[kind]
+        level = base if sec_int is None else max(0, min(4, round(base + (sec_int[si] - 0.5) * 4)))
+        level = min(level, max_level)
+        layers = list(LAYERS[kind]) if level == base else list(LEVEL_LAYERS[level])
+        if drone:
+            layers = [l for l in layers if l not in ("bass", "bass_whole")] + ["drone"]
+        if not P.get("melody", True):
+            layers = [l for l in layers if not l.startswith("mel")]
+        return layers
 
     # --- chord segments (bar, n_bars, degree, section index, offset in section)
     movements: dict = {}
@@ -318,7 +389,10 @@ def compose(mood: str, duration: float, *, loop: bool = False, seed: int | None 
         m = si // MOVEMENT_EVERY
         mv = movement(m)
         is_end = kind == "end"
-        layers = ["pad", "bass", "keys_end", "spark"] if is_end else list(LAYERS[kind])
+        layers = ["pad", "bass", "keys_end", "spark"] if is_end else section_layers(kind, si)
+        if is_end and drone:
+            layers = ["pad", "drone", "keys_end", "spark"]
+        i_sec = 0.5 if sec_int is None else sec_int[si]
         if drum_style is None:
             layers = [l for l in layers if not l.startswith("drums")]
         if not P["mel_in_verse"]:
@@ -326,24 +400,34 @@ def compose(mood: str, duration: float, *, loop: bool = False, seed: int | None 
         chord = chord_from_degree(root, scale, s["deg"], seventh)
         pad_notes = pad_v.voice(chord)
         key_notes = key_v.voice(chord)
+        if dissonance and rdis.random() < dissonance:  # clash: minor 2nd above the lowest pad note, or a tritone
+            clash = pad_notes[0] + 1 if rdis.random() < 0.6 else pad_notes[0] + 6
+            pad_notes = pad_notes + [clash if clash <= 74 else clash - 12]
         bass_pc = chord[0] % 12
         bass_root = 33 + ((bass_pc - 33) % 12)
 
         for rel in range(s["n"]):
             bar = s["bar"] + rel
             r_in_sec = bar - sec_start
-            g = KIND_GAIN["outro" if is_end else sec_kind]
-            if sec_kind == "build" and sec_n > 1 and not is_end:
+            g = kind_gain["outro" if is_end else sec_kind]
+            if sec_kind == "build" and sec_n > 1 and not is_end and "kind_gain" not in P:
                 g = 0.88 + 0.22 * (r_in_sec / (sec_n - 1))
             if is_end:
                 g = 0.8
+            if sec_int is not None:
+                g *= 0.85 + 0.3 * i_sec
+
+            if "drone" in layers and bar == sec_start and not is_end:  # pedal: root + fifth under the whole section
+                d_root = 28 + ((key_pc - 28) % 12)
+                for p, v in ((d_root, 70), (d_root + 7, 58)):
+                    add(CH_BASS, bar * 4.0, sec_n * 4.0, p, v * g, hum=0.0)
 
             if "pad" in layers and rel == 0:
                 for p in pad_notes:
                     add(CH_PAD, bar * 4.0, s["n"] * 4.0, p, 62 * g, hum=0.0)
 
-            if "bass" in layers:
-                pat = [(0, 16, 0)] if is_end else BASS_PATTERNS[mv["bass"]]
+            if "bass" in layers or "bass_whole" in layers:
+                pat = [(0, 16, 0)] if (is_end or "bass" not in layers) else BASS_PATTERNS[mv["bass"]]
                 for step, ln, off in pat:
                     p = bass_root + off
                     if p > 52:
@@ -380,7 +464,10 @@ def compose(mood: str, duration: float, *, loop: bool = False, seed: int | None 
                 for step, ln, p, v in ph[r_in_sec % len(ph)]:
                     add(CH_MEL, t(bar, step), ln * 0.25 * 0.97, p, v * g)
 
-            if "spark" in layers and rsp.random() < spark_p[kind if not is_end else "end"]:
+            sp = spark_p[kind if not is_end else "end"]
+            if spark_scale != 1.0 or sec_int is not None:
+                sp = min(1.0, sp * spark_scale * (0.5 + i_sec))
+            if "spark" in layers and rsp.random() < sp:
                 tones = [p for p in chord]
                 for j in range(2 if (not is_end and rsp.random() < 0.35) else 1):
                     pc = rsp.choice(tones) % 12
@@ -408,9 +495,15 @@ def compose(mood: str, duration: float, *, loop: bool = False, seed: int | None 
     mixmap = {CH_PAD: "pad", CH_BASS: "bass", CH_KEYS: "keys", CH_MEL: "mel", CH_SPARK: "spark", CH_DRUM: "drums"}
     channel_cc = {ch: {"vol": P["mix"][mixmap[ch]], "pan": pans[ch], "rev": revs[ch]} for ch in pans}
 
+    section_db = None
+    if sec_int is not None:
+        mean = sum(sec_int) / len(sec_int)
+        section_db = [INTENSITY_SPAN_DB * (v - mean) for v in sec_int]
     return Plan(mood=name, seed=seed, key=NOTE_NAMES[key_pc], mode=mode, bpm=bpm_fit, bars=bars,
-                duration=duration, loop=loop, fade_out=0.0 if open_end else fade_out, open_end=open_end, beats=total, notes=notes, programs=programs,
-                channel_cc=channel_cc, reverb=P["reverb"], sections=sections, cal_lufs=P["cal"])
+                duration=duration, loop=loop, fade_out=0.0 if open_end else fade_out, open_end=open_end,
+                beats=total, notes=notes, programs=programs, channel_cc=channel_cc, reverb=P["reverb"],
+                sections=sections, cal_lufs=P["cal"], intensity=curve, section_intensity=sec_int,
+                section_db=section_db)
 
 
 # ---------------------------------------------------------------- MIDI export

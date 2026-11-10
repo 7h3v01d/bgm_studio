@@ -16,8 +16,34 @@ FluidSynth. Same idea as your voice appliance: your app calls it over **REST** o
 * **Voice-aware mixing.** `POST /mix` takes your narration, fits music to it, ducks the music under speech
   (with look-ahead and word-gap hold, so it doesn't pump), and normalises to -16 LUFS.
 
-Moods: `calm, lofi, cinematic, uplifting, corporate, dark, ambient, tech` (+ aliases like `chill`, `epic`,
-`suspense`, `study`). Add your own by adding a dict in `presets.py`; no code changes needed.
+Moods: `calm, lofi, cinematic, uplifting, corporate, dark, ambient, tech`, plus four for storytelling:
+`horror, sleep, folklore, suspense` (+ aliases like `chill`, `epic`, `creepypasta`, `bedtime`, `myth`, `tension`).
+Add your own by adding a dict in `presets.py`; no code changes needed.
+
+| Story mood | Sound | Aliases |
+|---|---|---|
+| `horror` | choir pad over a contrabass drone, music box, distant bells, clashing tones; no beat | creepy, creepypasta, scary, spooky, haunted, dread |
+| `sleep` | 44-56 BPM, flat and soft, string drone, harp, rare celesta; no drums, no melody | bedtime, sleep_story, lullaby |
+| `folklore` | harp arpeggios, flute melody, cello and strings, frame drum, slight lilt | folk, myth, mythology, legend, fairytale |
+| `suspense` | pizzicato ostinato, pulsing synth bass, heartbeat kick, uneasy strings | tension, thriller, chase |
+
+## Intensity (tension curves)
+
+Every generate/stream/mix call and every scene takes an optional `intensity`:
+
+* a number `0..1`: `0.5` is the mood as designed; lower is sparser, slower and quieter, higher is busier, faster and
+  louder (within the mood's own tempo range), or
+* a list of `0..1` points spread evenly across the track, e.g. `[0.2, 0.3, 0.6, 1.0, 0.3]`: a tension curve.
+  Each section follows the curve, and quiet stretches stay quiet after loudness normalisation (up to 8 dB apart).
+
+In a sequence, a scene's intensity also sets its level against the other scenes, and `transitions: "auto"` reads
+it: a jump in tension gets a riser/impact, a drop gets a downlifter. Leave `intensity` out and the music is
+note-for-note what earlier versions made.
+
+```bash
+python -m bgmstudio.cli generate horror 600 --intensity 0.2,0.3,0.5,0.9,0.3 --seed 7
+python -m bgmstudio.cli sequence sleep:60:0.1,horror:45:0.6,horror:30:1.0 --transitions auto
+```
 
 ## Install
 
@@ -45,7 +71,8 @@ drop them **inside the project folder** and the code finds them automatically:
    in `bin\`, or one folder down). Or set `FLUIDSYNTH_DIR` to the folder containing them.
 3. **ffmpeg + ffprobe** on your PATH (`ffmpeg -version` should work in a new terminal).
 
-Then run `test.bat`. Anything missing produces an error naming exactly what to add and where.
+Then run `test.bat` (fast regression tests via pytest, then the full selftest). Anything missing produces an error naming
+exactly what to add and where.
 
 ## REST
 
@@ -59,6 +86,9 @@ uvicorn bgmstudio.api:app --host 0.0.0.0 --port 8765      # BGM_API_KEY=secret t
 | `GET /bgm/stream?mood=&duration=&seed=` | Progressive 16-bit WAV, `Content-Length` known up front. Non-loop. |
 | `POST /mix` | multipart: `narration` file + `mood, lead_in, tail_out, music_lufs, duck_db, final_lufs, seed, format` returns the finished mix. |
 | `GET /moods`, `GET /health`, `GET /files/{name}` | helpers |
+
+Out-of-range parameters return **422** naming the field; the limits are listed in `/docs` and in `bgmstudio.service.LIMITS`.
+Identical requests made at the same time render once and share the cached file.
 
 `format`: wav, flac, mp3, m4a, ogg. Results are cached on disk by parameters (`BGM_OUT_DIR`, default `./bgm_out`).
 
@@ -121,6 +151,38 @@ Both apply to `/sequence`, to `scenes` in `/mix`, to the MCP tools and to the CL
 ```bash
 python -m bgmstudio.cli sequence calm:18,cinematic:20,lofi:18,tech:18 --seed 11 --transitions auto
 ```
+
+## Cue sheets, stems and provenance
+
+Every result (REST `?as_json=true`, MCP, CLI, `bgm_client.py`) carries three extra things, and the same record is
+saved next to the audio as `<file>.json` (`meta_url` in REST; binary responses point to it in `X-BGM-Meta-URL`).
+
+**Cue sheet** (`cues`): where everything falls in the file, in seconds:
+`scenes` (mood, start/end, bpm, beat length, key), `sections` (intro/verse/build/peak/break/outro, with intensity
+when used), `downbeats` (every bar line), `transitions` (time and type at each cut) and, for mixes, `narration`
+(start/end). Use it to land video cuts, chapter cards and captions on the beat. MCP results leave out the per-bar
+list to keep agent context small; it's in the JSON file.
+
+**Stems** (`stems: true`): separate files beside the main one that add back up to it exactly:
+
+| Call | Stems |
+|---|---|
+| `/bgm` | pad, bass, keys, melody, sparkle, drums |
+| `/sequence` | the instrument groups plus `fx` (transitions) |
+| `/mix` | voice, music, fx (aligned, ducked and levelled as in the mix) |
+
+FluidSynth reuses voice slots and carries a little state into the next note's attack, so a full render and the sum
+of separately rendered instruments differ slightly. A stems render therefore builds its mix from the stems. It's its
+own cached take and can differ from a plain render of the same seed in the first milliseconds of some notes.
+Stems are limited to an hour per file (memory). Stems from lossy formats (mp3/m4a/ogg) won't null exactly; use wav or
+flac when you need that.
+
+**Provenance** (`provenance`): engine version, seed, every input, the SoundFont (file, size, SHA-256, licence),
+the FluidSynth version, and the SHA-256 of every file written, for answering a Content ID claim or checking a file
+later. Licences of GeneralUser GS, FluidR3, MuseScore_General and TimGM6mb are built in; for any other font put a
+`<font>.license.txt` next to the `.sf2` (or set `BGM_SOUNDFONT_LICENSE`), otherwise the record says "unknown" and how
+to fix it. TimGM6mb is GPL-2.0, and whether that reaches rendered audio is unsettled: publish with GeneralUser GS or
+FluidR3.
 
 ## Using it from your studio app
 
