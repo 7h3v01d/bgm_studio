@@ -3,6 +3,8 @@
 Run `run_gui.bat` for the dark industrial desktop console (PyQt6). See [GUI_README.md](GUI_README.md). It talks to
 the local REST service; the engine is unchanged.
 
+<img width="1180" height="860" alt="bgm_studio_console" src="https://github.com/user-attachments/assets/10826a83-4573-4cd6-89a2-7b0989496f3b" />
+
 # bgmstudio: procedural background music for your video pipeline
 
 A small service that composes instrumental background music from a **mood + duration** and renders it with
