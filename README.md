@@ -1,6 +1,6 @@
 # BGM Studio
 
-<img width="1280" height="900" alt="screenshot" src="/docs/images/screenshots.png" />
+<img width="1280" height="900" alt="screenshot" src="/docs/images/screenshot.png" />
 
 Procedural background music, composed on demand. Ask for a mood and a length and BGM Studio composes an original
 instrumental piece, renders it with FluidSynth and a General MIDI SoundFont, and returns a file of exactly that
