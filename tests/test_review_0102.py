@@ -78,14 +78,21 @@ def test_identical_concurrent_requests_still_render_once(tmp_path, monkeypatch):
     monkeypatch.setattr(service, "render_music", lambda *a, **kw: (calls.append(1), real(*a, **kw))[1])
     barrier = threading.Barrier(3)
 
+    results, errors = [], []
     def go():
-        barrier.wait()
-        service.generate_bgm("calm", 6, seed=7, out_dir=str(tmp_path))
+        try:
+            barrier.wait(timeout=20)
+            results.append(service.generate_bgm("calm", 6, seed=7, out_dir=str(tmp_path)))
+        except Exception as exc:
+            errors.append(exc)
     ts = [threading.Thread(target=go) for _ in range(3)]
     for t in ts:
         t.start()
     for t in ts:
         t.join()
+    assert not errors, f"concurrent request errors: {errors!r}"
+    assert len(results) == 3
+    assert len({r["path"] for r in results}) == 1
     assert len(calls) == 1
 
 

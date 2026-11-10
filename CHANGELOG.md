@@ -1,3 +1,79 @@
+## 0.11.0 (2026-11-11): scene sequencer in the console
+
+- New **SEQUENCE** tab: a scene table (mood, length, intensity, transition into the scene, BPM, start), toolbar
+  (add, duplicate, remove, reorder), a scene bar showing the plan (energy shading, transition marks, narration end;
+  click to select), and the sequence settings (default transition, crossfade, tempo match, max BPM jump).
+- **Narration scoring** from the same tab: load a voice-over, check the scene total against it (within 1.5 s), **FIT**
+  scales the scenes to match, and **SCORE NARRATION** renders the ducked mix (lead-in, tail-out, duck depth).
+- **Scene files** (LOAD/SAVE) in the API's own shape, so InkHeart/Reelwright can hand scenes to the console.
+- Seed, format, stems, export folder and file name are shared by both tabs; the log moved into the right column so
+  the window fits a 1080p screen. The output panel and cue strip handle sequences and mixes (scene numbers, cuts,
+  narration span, BPM range, tempo warnings in the log).
+- `bgmgui/scenes.py` holds the scene logic with no Qt (validation, start times, fit, scene files, result summary);
+  `tests/test_sequencer.py` (25 tests) checks it, including that its transition and energy tables match the engine.
+  `tests/test_gui_qt.py` adds 9 sequencer tests that drive the tab like an operator.
+- Engine, REST API and `ENGINE_REVISION` unchanged.
+
+## 0.10.4 (2026-11-11): PyQt6 desktop console
+
+- Rebuilt the GUI in PyQt6 on the shared dark industrial design system (Obsidian/Panel/Border, Teal accent,
+  Phosphor/Amber/Red states, JetBrains Mono, flat zero-radius controls), replacing the Tkinter phase-01 console.
+  Code is in the `bgmgui` package; `bgm_gui.py` is the launcher and still exports the validation helpers.
+- Same scope (single-track generation) plus: moods and descriptions loaded from the service; a cue strip showing
+  sections, bars and transitions with a playback cursor; in-app playback with seek for every format (QtMultimedia,
+  replacing winsound/ffplay); SoundFont licence shown and flagged amber when it is unknown or GPL; copy/reuse seed;
+  timestamped operator log; elapsed render timer.
+- Background work uses QObject workers on QThreads (kept alive in `_worker_refs`). The console stops the service on
+  exit only if it started it; closing mid-render asks first.
+- The media player is created on first PLAY, so a broken audio stack can't stop the console starting
+  (`BGM_GUI_NO_AUDIO=1` turns playback off).
+- `tests/test_gui_qt.py`: 11 offscreen tests with a fake client (no server, display or audio device needed).
+- `requirements.txt` adds PyQt6. Engine, REST API and `ENGINE_REVISION` unchanged.
+
+## GUI Phase 01 (2026-11-11) — optional desktop client
+
+- Added industrial-themed `bgm_gui.py` and `run_gui.bat` for track generation, loop/intensity controls, export and playback.
+- Added `tests/test_gui.py` with 18 headless input-validation tests and `GUI_README.md` with Windows manual acceptance checks.
+- No changes to synthesis engine, REST endpoints, `ENGINE_REVISION`, or existing tests.
+
+## v0.10.3 Windows test-contract correction
+
+- Updated `test_failed_write_leaves_no_partial_file` to expect the documented actionable `RuntimeError` after a bounded two-attempt write failure, to assert that its chained cause is the original `OSError`, and to verify both retry attempts and no partial artifacts.
+- No application, audio-rendering, cache, or API changes.
+- This corrects a regression-test expectation mismatch discovered on Windows (122 passed, 1 failed, 2 skipped before correction).
+
+## 0.10.3 output-write diagnostic hotfix (2026-11-10)
+
+- Addressed a second intermittent Windows `soundfile.LibsndfileError: System error` failure, now seen when writing a final `/sequence` output rather than when measuring LUFS. The root OS cause is not established from the reported traceback.
+- WAV/FLAC writes now retry once after a short delay if libsndfile reports a write error; each attempt uses a fresh temporary sibling path, preserving the last good output and cleaning up partial files.
+- Persistent failures log the destination path, estimated audio payload size, free disk capacity, and underlying error locally; the REST error remains a non-sensitive HTTP 500 with troubleshooting guidance.
+- Added tests for a transient failure, persistent failure with atomic preservation, and byte-identical successful PCM24 WAV output.
+- No change to music composition, PCM data, normal successful encoding, or `ENGINE_REVISION`. Release manifest regenerated.
+- A passing Windows end-to-end verification is still required. The retry is not a substitute for fixing insufficient disk space, native-library errors, or permissions problems.
+
+## 0.10.3 release-verification LUFS hotfix (2026-11-10)
+
+- Replaced the temporary float WAV in `measure_lufs()` with raw float32 PCM delivered to FFmpeg over stdin. This avoids large temporary-file writes and reduces sensitivity to Windows TEMP volume errors during repeated release tests. FFmpeg `ebur128` measurement and gain/normalisation algorithms are unchanged.
+- FFmpeg loudness failures now raise a descriptive error rather than being interpreted as silence.
+- Added four regression tests for diskless loudness, process failures, empty audio and channel validation.
+- Rebuilt `RELEASE_SHA256.json` to cover the modified source, test and documentation. Previous release manifests intentionally do not match this updated baseline.
+- Full Windows release verification is pending; the prior 116-pass Windows run validates the unpatched build, not this hotfix.
+
+## 0.10.3 Windows regression hotfix (2026-11-10)
+
+- Fixed `POST /mix` returning HTTP 500 for undecodable narration after the new ffprobe preflight. The service now translates failed ffprobe execution and malformed duration metadata into a clear invalid-media `ValueError`, which the API maps to HTTP 422.
+- Added focused regression coverage for the ffprobe process-failure and malformed-metadata paths. No rendering parameters, resource budgets, cache identity, or audio-generation algorithms changed.
+
+## 0.10.3 (2026-11-10): targeted resource and integrity hardening
+
+- Added configurable estimated float32 stereo PCM working-memory admission budget (`BGM_MAX_RENDER_MEMORY_MIB`, default 16384). The two-hour duration limit remains unchanged. This is an estimate, not a guarantee against out-of-memory conditions.
+- Mix narration duration is now probed **before decoding** and checked with lead/tail, stem and estimated memory requirements. The existing `read_audio()` independent duration checks remain; decoded WAV frame count is checked before loading samples into NumPy.
+- Unix render locks now honor `BGM_LOCK_TIMEOUT` via non-blocking `flock`, matching Windows behaviour.
+- Added `BGM_STRICT_CACHE_HASHES=1` as a full-rehash integrity mode to detect same-size file changes with restored modification timestamps. Default cache-fast mode remains unchanged.
+- Concurrency test now asserts all worker threads complete successfully, not merely that the renderer was called once.
+- Added focused v0.10.3 regressions; expanded existing synthetic test mocks to cover the new pre-decode probe.
+- No changes to composition algorithms, sound presets, audio synthesis, or `ENGINE_REVISION`.
+
 ## 0.10.2 (2026-11-10): review fixes for 0.10.1
 
 Each fix has a test in `tests/test_review_0102.py` that fails on 0.10.1.

@@ -124,9 +124,20 @@ def test_failed_write_leaves_no_partial_file(tmp_path, monkeypatch):
             f.write(b"RIFF partial")
         raise OSError("disk full")
 
-    monkeypatch.setattr(audio.sf, "write", broken_write)
-    with pytest.raises(OSError):
+    monkeypatch.setattr(audio.time, "sleep", lambda _: None)
+    calls = []
+
+    def counted_broken_write(path, *args, **kwargs):
+        calls.append(path)
+        return broken_write(path, *args, **kwargs)
+
+    monkeypatch.setattr(audio.sf, "write", counted_broken_write)
+    with pytest.raises(RuntimeError, match="audio output could not be written") as exc_info:
         audio.write_audio(str(target), np.zeros((100, 2), dtype=np.float32))
+    assert isinstance(exc_info.value.__cause__, OSError)
+    assert str(exc_info.value.__cause__) == "disk full"
+    assert len(calls) == 2
+    assert calls[0] != calls[1]
     assert not target.exists()
     assert list(tmp_path.iterdir()) == []
 

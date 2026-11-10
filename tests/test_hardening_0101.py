@@ -106,6 +106,7 @@ def test_mix_outputs_distinguish_render_settings_and_cache(monkeypatch, tmp_path
     sf.write_bytes(b"soundfont test identity")
     monkeypatch.setattr(service, "find_soundfont", lambda *a, **kw: str(sf))
     monkeypatch.setattr(service, "read_audio", lambda *a, **kw: np.zeros((5 * service.SR, 2), dtype=np.float32))
+    monkeypatch.setattr("bgmstudio.audio.audio_duration", lambda *a, **kw: 5.0)
     class FakePlan:
         def summary(self):
             return {"mood": "calm", "seed": 4, "key": "C"}

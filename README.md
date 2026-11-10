@@ -1,3 +1,8 @@
+## Desktop console (PyQt6)
+
+Run `run_gui.bat` for the dark industrial desktop console (PyQt6). See [GUI_README.md](GUI_README.md). It talks to
+the local REST service; the engine is unchanged.
+
 # bgmstudio: procedural background music for your video pipeline
 
 A small service that composes instrumental background music from a **mood + duration** and renders it with
@@ -231,9 +236,9 @@ Launchers (double-click): `run_server.bat` (API on 127.0.0.1:8765, docs at `/doc
 * Duration range is 4 s to 2 hours (`BGM_MAX_RENDER_SECONDS`, default 7200, can lower it). Very short clips (a few seconds) may speed up the tempo noticeably to fit whole bars.
 
 
-## v0.10.1 hardening / operational limits
+## v0.10.3 hardening / operational limits
 
-**This is a targeted local-first hardening release, not a certification for public Internet hosting.**
+**This remains a targeted local-first hardening release, not a certification for public Internet hosting.**
 The default limits are deliberately conservative for single-user desktop systems:
 
 | Environment variable | Default | Purpose |
@@ -242,7 +247,9 @@ The default limits are deliberately conservative for single-user desktop systems
 | `BGM_MAX_SCENES` | `100` | Maximum accepted scenes per sequence/mix |
 | `BGM_MAX_UPLOAD_BYTES` | `104857600` | Maximum uploaded/input narration bytes (100 MiB) |
 | `BGM_FFMPEG_TIMEOUT` | `180` | FFmpeg/FFprobe timeout in seconds |
-| `BGM_LOCK_TIMEOUT` | `600` | Windows process lock acquisition deadline in seconds |
+| `BGM_LOCK_TIMEOUT` | `600` | Cross-platform process lock acquisition deadline in seconds |
+| `BGM_MAX_RENDER_MEMORY_MIB` | `16384` | Estimated render PCM-memory admission ceiling in MiB (not a measurement of actual available RAM) |
+| `BGM_STRICT_CACHE_HASHES` | `0` | Set to `1` to rehash SoundFonts and outputs on every cache check, even when file timestamps and sizes are unchanged |
 | `BGM_MCP_OUTPUT_DIR` | `BGM_OUT_DIR` or `bgm_out` | Root of allowed MCP output directory tree |
 | `BGM_MCP_INPUT_DIR` | unset (narration denied) | Root of allowed MCP narration input files |
 
@@ -250,7 +257,7 @@ Explicitly configure `BGM_MCP_INPUT_DIR` before exposing narration mixing throug
 Symlinks are resolved for MCP directory checks; paths outside the configured roots are refused.
 Outputs use a new request fingerprint and will not reuse filenames from older releases.
 File hashes in the metadata are checked before reusing cached results. Each file is hashed once per process and
-re-hashed only if its size or modification time changes. Cache hits are answered without waiting for the render
+re-hashed if its size or modification time changes; use `BGM_STRICT_CACHE_HASHES=1` to also detect same-size edits with restored timestamps. Cache hits are answered without waiting for the render
 lock, so they never queue behind a long render. Cache names follow `ENGINE_REVISION` in `service.py` (bump it when
 the audio for a given request changes), not the package version.
 
@@ -261,6 +268,15 @@ Multipart bodies may be spooled by the framework before the endpoint copy limit 
 for Internet exposure, an ingress/proxy body-size cap is mandatory. Untrusted media still
 needs process-level isolation for comprehensive decoder security.
 
+**Memory admission:** A duration within the two-hour limit can still be rejected if estimated PCM working
+memory exceeds `BGM_MAX_RENDER_MEMORY_MIB`. Estimates use three simultaneous stereo float32 buffers for
+normal tracks, four for sequences, five for plain mixes, and higher estimates for stems. This is an
+approximation, not an allocation ceiling or a promise that the host has sufficient RAM. Defaults preserve
+normal long-form use while allowing operators on smaller machines to set a lower limit. Mix narration is
+probed before decoding, including the planned lead-in and tail-out in the admission check. FFmpeg probes
+and decodes are still subject to input changes between operations and should not be exposed to hostile files
+without OS-level isolation and quotas.
+
 **Known limits:** streaming audio is not globally admission-controlled across separate API
 workers; the cross-process lock protects file renders within a shared output directory only.
 Use one API worker for trusted local use. A production-grade job queue, CPU/memory quotas,
@@ -270,3 +286,7 @@ and authenticated per-client artifact ownership remain future work.
 For a clean Windows environment, run `setup.bat`, install the Native FluidSynth DLLs,
 and check that `python -c "import fluidsynth; print(fluidsynth.Synth)"` succeeds in the project
 virtual environment. The `pyfluidsynth` Python package is distinct from the native library.
+
+### Intermittent Windows audio output errors
+
+WAV/FLAC writes use libsndfile and atomic sibling temporary files. A transient libsndfile write failure is retried once; persistent failures preserve any previous output, clean up temporary fragments, and emit server-side disk-space/error diagnostics. Check both output and `%TEMP%` volumes, permissions and storage/security software if `audio output could not be written` appears. This is not a guarantee that a full or inaccessible destination can be recovered.

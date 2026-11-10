@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
+import shutil
 import subprocess
 import tempfile
+import time
 import uuid
 
 import numpy as np
@@ -23,20 +26,40 @@ LOSSY = {"mp3": ["-codec:a", "libmp3lame", "-q:a", "2"],
 FFMPEG_TIMEOUT = float(os.environ.get("BGM_FFMPEG_TIMEOUT", "180"))
 
 MIME = {"wav": "audio/wav", "flac": "audio/flac", "mp3": "audio/mpeg", "m4a": "audio/mp4", "ogg": "audio/ogg"}
+_LOG = logging.getLogger(__name__)
 
 
 def measure_lufs(audio: np.ndarray, sr: int = SR):
-    """Integrated loudness (BS.1770 via ffmpeg's ebur128). Returns None for silence."""
-    with tempfile.TemporaryDirectory() as d:
-        p = os.path.join(d, "m.wav")
-        sf.write(p, audio, sr, subtype="FLOAT")
-        r = subprocess.run(["ffmpeg", "-nostats", "-hide_banner", "-i", p, "-af", "ebur128=framelog=quiet",
-                            "-f", "null", "-"], capture_output=True, text=True, timeout=FFMPEG_TIMEOUT)
-    m = re.findall(r"I:\s+(-?[\d.]+|-inf)\s+LUFS", r.stderr)
-    if not m:
+    """Integrated loudness (BS.1770 via FFmpeg ebur128); no temporary WAV file.
+
+    Send raw float32 PCM through stdin instead of writing a potentially huge
+    scratch WAV to the Windows temporary directory.  The measurement filter,
+    sample values, rate and channel layout remain the same as before.
+    """
+    pcm = np.asarray(audio, dtype=np.float32)
+    if pcm.ndim == 1:
+        channels = 1
+    elif pcm.ndim == 2 and pcm.shape[1] in (1, 2):
+        channels = pcm.shape[1]
+    else:
+        raise ValueError("expected mono or stereo audio for loudness measurement")
+    if pcm.size == 0:
         return None
-    v = float(m[-1])
-    return v if math.isfinite(v) else None
+    pcm = np.ascontiguousarray(pcm, dtype="<f4")
+    command = ["ffmpeg", "-nostats", "-hide_banner", "-f", "f32le",
+               "-ar", str(sr), "-ac", str(channels), "-i", "pipe:0",
+               "-af", "ebur128=framelog=quiet", "-f", "null", "-"]
+    result = subprocess.run(command, input=pcm.tobytes(), capture_output=True,
+                            timeout=FFMPEG_TIMEOUT)
+    stderr = result.stderr.decode("utf-8", errors="replace")
+    if result.returncode != 0:
+        reason = (stderr.strip().splitlines() or ["unknown error"])[-1]
+        raise RuntimeError(f"FFmpeg loudness measurement failed: {reason}")
+    matches = re.findall(r"I:\s+(-?[\d.]+|-inf)\s+LUFS", stderr)
+    if not matches:
+        return None
+    value = float(matches[-1])
+    return value if math.isfinite(value) else None
 
 
 def loudness_gain(audio: np.ndarray, target: float, sr: int = SR, ceiling_db: float = -1.0):
@@ -66,26 +89,60 @@ def _partial_path(path: str) -> str:
     return os.path.join(d, f".{stem}.{uuid.uuid4().hex[:8]}.partial{ext}")
 
 
+def _output_write_failure(path: str, audio: np.ndarray, fmt: str, exc: BaseException) -> RuntimeError:
+    """Provide useful local diagnostics without returning paths or disk details to API clients."""
+    directory = os.path.dirname(os.path.abspath(path))
+    try:
+        free_mib = shutil.disk_usage(directory).free / (1024 * 1024)
+        free = f"{free_mib:.1f} MiB"
+    except OSError as disk_error:
+        free = f"unavailable ({disk_error})"
+    try:
+        nbytes = int(np.asarray(audio).nbytes)
+    except (ValueError, TypeError):
+        nbytes = -1
+    _LOG.error("Audio output write failed: path=%r format=%s pcm_bytes=%d free=%s error=%r",
+               path, fmt, nbytes, free, exc)
+    return RuntimeError("audio output could not be written; check destination disk space, "
+                        "write permissions and native audio libraries (see server log)")
+
+
 def write_audio(path: str, audio: np.ndarray, sr: int = SR) -> str:
-    """Encode `audio` to `path` atomically: readers see either no file or the complete file, never a partial one."""
+    """Encode audio atomically, retrying a transient libsndfile write once.
+
+    On failure, preserve an existing destination and remove partial files.
+    Each attempt uses a unique sibling partial path. No alternate encoder is
+    used: successful WAV/FLAC bytes retain the existing deterministic semantics.
+    """
     fmt = os.path.splitext(path)[1].lstrip(".").lower() or "wav"
     if fmt not in LOSSLESS and fmt not in LOSSY:
         raise ValueError(f"Unsupported format {fmt!r}; use one of: {', '.join(list(LOSSLESS) + list(LOSSY))}")
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    part = _partial_path(path)
-    try:
-        if fmt in LOSSLESS:
-            sf.write(part, audio, sr, format=LOSSLESS[fmt][0], subtype=LOSSLESS[fmt][1])
-        else:
-            with tempfile.TemporaryDirectory() as d:
-                tmp = os.path.join(d, "t.wav")
-                sf.write(tmp, audio, sr, subtype="FLOAT")
-                subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", tmp] + LOSSY[fmt] + [part], check=True, timeout=FFMPEG_TIMEOUT)
-        os.replace(part, path)
-    finally:
-        if os.path.exists(part):
-            os.remove(part)
-    return path
+    attempts = 2 if fmt in LOSSLESS else 1
+    for attempt in range(attempts):
+        part = _partial_path(path)
+        try:
+            if fmt in LOSSLESS:
+                sf.write(part, audio, sr, format=LOSSLESS[fmt][0], subtype=LOSSLESS[fmt][1])
+            else:
+                with tempfile.TemporaryDirectory() as d:
+                    tmp = os.path.join(d, "t.wav")
+                    sf.write(tmp, audio, sr, subtype="FLOAT")
+                    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", tmp] + LOSSY[fmt] + [part],
+                                   check=True, timeout=FFMPEG_TIMEOUT)
+            os.replace(part, path)
+            return path
+        except (sf.LibsndfileError, OSError) as exc:
+            if attempt + 1 < attempts:
+                _LOG.warning("Audio file write failed (attempt %d/%d); retrying: %s",
+                             attempt + 1, attempts, type(exc).__name__)
+                time.sleep(0.15)
+            else:
+                raise _output_write_failure(path, audio, fmt, exc) from exc
+        finally:
+            if os.path.exists(part):
+                os.remove(part)
+    raise AssertionError("unreachable audio write state")
 
 
 def write_json(path: str, data) -> str:
@@ -123,7 +180,12 @@ def read_audio(path: str, sr: int = SR) -> np.ndarray:
         if r.returncode != 0 or not os.path.isfile(tmp):
             reason = (r.stderr.strip().splitlines() or ["unknown error"])[-1]
             raise ValueError(f"could not decode audio file {os.path.basename(path)!r}: {reason}")
-        data, _ = sf.read(tmp, dtype="float32", always_2d=True)
+        # Decoder is capped with -t, but also inspect decoded frame count before loading
+        # into NumPy (a malformed container can otherwise allocate too much memory).
+        with sf.SoundFile(tmp) as decoded:
+            if decoded.frames > int(MAX_RENDER_SECONDS * sr):
+                raise ValueError("decoded narration exceeds duration budget")
+            data = decoded.read(dtype="float32", always_2d=True)
     if len(data) > int(MAX_RENDER_SECONDS * sr):
         raise ValueError("decoded narration exceeds duration budget")
     if not len(data):

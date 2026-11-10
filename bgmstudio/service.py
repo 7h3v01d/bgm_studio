@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import random
+import subprocess
 import time
 import threading
 from contextlib import contextmanager
@@ -53,16 +54,28 @@ def check_ranges(**values) -> None:
 MAX_RENDER_SECONDS = float(os.environ.get("BGM_MAX_RENDER_SECONDS", "7200"))  # the documented 2-hour limit
 MAX_SCENES = int(os.environ.get("BGM_MAX_SCENES", "100"))
 MAX_NARRATION_BYTES = int(os.environ.get("BGM_MAX_UPLOAD_BYTES", str(100 * 1024 * 1024)))
+# Conservative *estimate*, not an OS memory reservation. Lower on memory-constrained hosts.
+# Float32 stereo PCM takes SR * 2 channels * 4 bytes per second; each algorithm can hold
+# multiple simultaneous full-length arrays. Counts below deliberately include headroom.
+MAX_RENDER_MEMORY_MIB = int(os.environ.get("BGM_MAX_RENDER_MEMORY_MIB", "16384"))
 MAX_STEM_SECONDS = 3600.0  # stems hold ~3 full-length buffers in memory (about 1.3 GB each per hour of audio)
 
 
-def _check_budget(seconds: float, *, scenes: int = 1) -> None:
+def _check_budget(seconds: float, *, scenes: int = 1, buffers: int = 3) -> None:
     if not np.isfinite(seconds) or seconds < MIN_SECONDS:
         raise ValueError(f"duration must be finite and at least {MIN_SECONDS}s")
     if seconds > MAX_RENDER_SECONDS:
         raise ValueError(f"total duration exceeds render budget ({MAX_RENDER_SECONDS:g}s)")
     if scenes > MAX_SCENES:
         raise ValueError(f"scene count exceeds budget ({MAX_SCENES})")
+    # Enforce an operator-controlled admission budget *before* allocating large arrays.
+    # This estimates buffers for each call path; actual peak memory remains platform-dependent.
+    if buffers < 1:
+        raise ValueError("buffer estimate must be positive")
+    estimated_mib = seconds * SR * 2 * 4 * buffers / (1024 * 1024)
+    if estimated_mib > MAX_RENDER_MEMORY_MIB:
+        raise ValueError(f"estimated render memory {estimated_mib:.0f} MiB exceeds budget "
+                         f"({MAX_RENDER_MEMORY_MIB} MiB); lower duration or adjust BGM_MAX_RENDER_MEMORY_MIB")
 
 
 # Bump when a change alters the audio produced for the same request (composer, renderer, mixing, fx).  Cache names
@@ -172,7 +185,15 @@ def _render_lock(path: str):
                     msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
             else:
                 import fcntl
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                deadline = time.monotonic() + float(os.environ.get("BGM_LOCK_TIMEOUT", "600"))
+                while True:
+                    try:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("timed out waiting for BGM output directory lock")
+                        time.sleep(0.1)
                 try:
                     yield
                 finally:
@@ -227,7 +248,7 @@ def generate_bgm(mood: str = "calm", duration: float = 60.0, *, loop: bool = Fal
         raise ValueError(f"format must be one of {', '.join(MIME)}")
     check_ranges(target_lufs=target_lufs, fade_out=fade_out, bpm=bpm)
     intensity = parse_intensity(intensity)
-    _check_budget(float(duration))
+    _check_budget(float(duration), buffers=5 if stems else 3)
     _check_stems(stems, float(duration))
     mood = resolve_mood(mood)[0]  # canonical name: aliases share one cache entry, and nothing unvalidated
     seed = _new_seed(seed)        # ever reaches a file name
@@ -393,7 +414,9 @@ def render_sequence(scenes: list, *, xfade: float = 2.0, seed: int | None = None
                   own "transition" key overrides the cut *into* that scene).  auto = by mood energy change.
     fx_level_db   transition loudness relative to the surrounding music.
     -> (audio, [per-scene summary], LUFS, key)"""
-    parts = _sequence_parts(scenes, xfade=xfade, seed=seed, key=key, target_lufs=target_lufs, last_fade=last_fade,
+    validated = _validate_scenes(scenes)
+    _check_budget(sum(sc["duration"] for sc in validated), scenes=len(validated), buffers=4)
+    parts = _sequence_parts(validated, xfade=xfade, seed=seed, key=key, target_lufs=target_lufs, last_fade=last_fade,
                             soundfont=soundfont, tempo_match=tempo_match, max_bpm_jump=max_bpm_jump,
                             transitions=transitions, fx_level_db=fx_level_db)
     out, lufs = normalize_lufs(parts["music"], target_lufs)
@@ -524,7 +547,7 @@ def generate_sequence(scenes: list, *, xfade: float = 2.0, seed: int | None = No
     check_ranges(xfade=xfade, target_lufs=target_lufs, fade_out=fade_out, max_bpm_jump=max_bpm_jump,
                  fx_level_db=fx_level_db)
     scenes = [{**s, "mood": resolve_mood(s["mood"])[0]} for s in _validate_scenes(scenes)]
-    _check_budget(sum(s["duration"] for s in scenes), scenes=len(scenes))
+    _check_budget(sum(s["duration"] for s in scenes), scenes=len(scenes), buffers=6 if stems else 4)
     _check_stems(stems, sum(s["duration"] for s in scenes))
     seed = _new_seed(seed)
     sf_path = find_soundfont(soundfont)
@@ -601,10 +624,22 @@ def mix_with_narration(narration_path: str, mood: str = "calm", *, lead_in: floa
         raise FileNotFoundError(f"narration file not found: {narration_path}")
     if os.path.getsize(narration_path) > MAX_NARRATION_BYTES:
         raise ValueError(f"narration exceeds input byte budget ({MAX_NARRATION_BYTES} bytes)")
+    # Probe before decoding so even a small compressed file cannot force an oversized
+    # PCM allocation; include lead/tail and optional stems in the admission check.
+    from .audio import audio_duration
+    try:
+        narr_probe_s = audio_duration(narration_path)
+    except (subprocess.CalledProcessError, ValueError, OverflowError) as exc:
+        # Invalid narration is a client-input error, not an internal server failure.
+        # Keep the public message stable and avoid exposing ffprobe internals.
+        raise ValueError(f"could not decode audio file {os.path.basename(narration_path)!r}: invalid media") from exc
+    _check_budget(lead_in + narr_probe_s + tail_out, scenes=len(scenes) if scenes else 1,
+                  buffers=7 if stems else 5)
+    _check_stems(stems, lead_in + narr_probe_s + tail_out)
     voice = read_audio(narration_path)
     narr_s = len(voice) / SR
     total = lead_in + narr_s + tail_out
-    _check_budget(total, scenes=len(scenes) if scenes else 1)
+    _check_budget(total, scenes=len(scenes) if scenes else 1, buffers=7 if stems else 5)
     _check_stems(stems, total)
     seed = _new_seed(seed)
     # Preserve canonical original scenes, before lead-in/tail-out adjustments.

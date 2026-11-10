@@ -49,7 +49,10 @@ def file_sha256(path: str) -> str:
 
 def cached_sha256(path: str) -> str:
     """SHA-256 of a file, computed once per process for each (real path, size, mtime) and reused after that.
-    Any change to the file changes its size or modification time, so a modified file is hashed again."""
+    Fast mode trusts size and mtime, so a same-size rewrite with a restored timestamp can be
+    missed. Set BGM_STRICT_CACHE_HASHES=1 for full validation on every lookup."""
+    if os.environ.get("BGM_STRICT_CACHE_HASHES", "0").lower() in ("1", "true", "yes"):
+        return file_sha256(path)
     st = os.stat(path)
     key = (os.path.realpath(path), st.st_size, st.st_mtime_ns)
     with _sha_lock:

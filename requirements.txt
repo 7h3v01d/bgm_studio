@@ -7,4 +7,5 @@ uvicorn
 python-multipart         # for POST /mix uploads
 mcp                      # works with SDK 1.x (FastMCP) and 2.x (MCPServer)
 httpx                    # only for selftest / client example
+PyQt6                    # desktop console (bgm_gui.py); includes QtMultimedia for playback
 # system: ffmpeg + ffprobe on PATH (loudness measurement, mp3/m4a/ogg encoding, decoding narration)
