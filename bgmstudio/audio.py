@@ -20,6 +20,8 @@ LOSSLESS = {"wav": ("WAV", "PCM_24"), "flac": ("FLAC", "PCM_24")}
 LOSSY = {"mp3": ["-codec:a", "libmp3lame", "-q:a", "2"],
          "m4a": ["-codec:a", "aac", "-b:a", "256k"],
          "ogg": ["-codec:a", "libvorbis", "-q:a", "6"]}
+FFMPEG_TIMEOUT = float(os.environ.get("BGM_FFMPEG_TIMEOUT", "180"))
+
 MIME = {"wav": "audio/wav", "flac": "audio/flac", "mp3": "audio/mpeg", "m4a": "audio/mp4", "ogg": "audio/ogg"}
 
 
@@ -29,7 +31,7 @@ def measure_lufs(audio: np.ndarray, sr: int = SR):
         p = os.path.join(d, "m.wav")
         sf.write(p, audio, sr, subtype="FLOAT")
         r = subprocess.run(["ffmpeg", "-nostats", "-hide_banner", "-i", p, "-af", "ebur128=framelog=quiet",
-                            "-f", "null", "-"], capture_output=True, text=True)
+                            "-f", "null", "-"], capture_output=True, text=True, timeout=FFMPEG_TIMEOUT)
     m = re.findall(r"I:\s+(-?[\d.]+|-inf)\s+LUFS", r.stderr)
     if not m:
         return None
@@ -78,7 +80,7 @@ def write_audio(path: str, audio: np.ndarray, sr: int = SR) -> str:
             with tempfile.TemporaryDirectory() as d:
                 tmp = os.path.join(d, "t.wav")
                 sf.write(tmp, audio, sr, subtype="FLOAT")
-                subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", tmp] + LOSSY[fmt] + [part], check=True)
+                subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", tmp] + LOSSY[fmt] + [part], check=True, timeout=FFMPEG_TIMEOUT)
         os.replace(part, path)
     finally:
         if os.path.exists(part):
@@ -105,14 +107,25 @@ def read_audio(path: str, sr: int = SR) -> np.ndarray:
     Raises FileNotFoundError if `path` is missing and ValueError (with ffmpeg's reason) if it can't be decoded."""
     if not os.path.isfile(path):
         raise FileNotFoundError(f"narration file not found: {path}")
+    from .service import MAX_RENDER_SECONDS, MAX_NARRATION_BYTES
+    if os.path.getsize(path) > MAX_NARRATION_BYTES:
+        raise ValueError("narration exceeds input byte budget")
+    try:
+        duration = audio_duration(path)
+    except (subprocess.CalledProcessError, ValueError) as e:
+        raise ValueError(f"could not decode audio file {os.path.basename(path)!r}: invalid media") from e
+    if not math.isfinite(duration) or duration <= 0 or duration > MAX_RENDER_SECONDS:
+        raise ValueError(f"narration duration exceeds input budget ({MAX_RENDER_SECONDS:g}s)")
     with tempfile.TemporaryDirectory() as d:
         tmp = os.path.join(d, "in.wav")
         r = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", path, "-ac", "2", "-ar", str(sr),
-                            "-c:a", "pcm_f32le", tmp], capture_output=True, text=True)
+                            "-t", str(MAX_RENDER_SECONDS + 1), "-c:a", "pcm_f32le", tmp], capture_output=True, text=True, timeout=FFMPEG_TIMEOUT)
         if r.returncode != 0 or not os.path.isfile(tmp):
             reason = (r.stderr.strip().splitlines() or ["unknown error"])[-1]
             raise ValueError(f"could not decode audio file {os.path.basename(path)!r}: {reason}")
         data, _ = sf.read(tmp, dtype="float32", always_2d=True)
+    if len(data) > int(MAX_RENDER_SECONDS * sr):
+        raise ValueError("decoded narration exceeds duration budget")
     if not len(data):
         raise ValueError(f"audio file {os.path.basename(path)!r} contains no samples")
     return data
@@ -120,7 +133,7 @@ def read_audio(path: str, sr: int = SR) -> np.ndarray:
 
 def audio_duration(path: str) -> float:
     r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of",
-                        "default=nw=1:nk=1", path], capture_output=True, text=True, check=True)
+                        "default=nw=1:nk=1", path], capture_output=True, text=True, check=True, timeout=FFMPEG_TIMEOUT)
     return float(r.stdout.strip())
 
 

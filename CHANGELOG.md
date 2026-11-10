@@ -1,3 +1,38 @@
+## 0.10.2 (2026-11-10): review fixes for 0.10.1
+
+Each fix has a test in `tests/test_review_0102.py` that fails on 0.10.1.
+
+- **Render budget back to the documented 2 hours.** `BGM_MAX_RENDER_SECONDS` defaults to 7200 again (it was 600, which
+  refused 30-minute sleep beds and narration over 10 minutes, while the API advertised 7200). The variable still
+  lowers it.
+- **Cache hits no longer queue behind renders.** Tracks, sequences and mixes check the cache before taking the render
+  lock (and again after, so identical concurrent requests still render once). A cached call during a 400 s render
+  took 8.6 s on 0.10.1.
+- **No full re-hash on every cache hit.** SoundFont and output hashes are computed once per process per
+  (path, size, modification time); a modified file is still caught.
+- **Cache names follow `ENGINE_REVISION`**, not the package version, so releases that don't change the sound keep the
+  cache. (One-time re-render from 0.10.1 names.)
+- A malformed `Content-Length` on `/mix` returns **400** (was an unhandled exception → bare 500).
+- A render-lock timeout returns **503** with `Retry-After` (was a bare 500).
+
+## 0.10.1 — Windows self-test compatibility follow-up (2026-11-10)
+
+- The standalone `selftest.py` intentionally renders a 1,200-second FLAC track. It now raises `BGM_MAX_RENDER_SECONDS` to at least 1,200 seconds **for the self-test process only**, before loading the service; normal invocations retain the 600-second default.
+- No production render-limit bypass or runtime API changes.
+
+## 0.10.1 — Integrity and resource-safety hardening (2026-11-10)
+
+- Full canonical request fingerprints (including SoundFont SHA-256 and engine version) prevent narration mixes differing only in ducking, loudness, scenes or other options from sharing an output filename. All render paths now use content-based cache keys; old cache names deliberately migrate.
+- Narration mixes now use the shared render lock and reuse verified cached outputs; directory-wide OS file locks coordinate across CLI/API processes. Per-process rendering is serial to reduce peak allocations.
+- Explicit default output-duration budget (600 s), scene-count budget (100), narration upload byte budget (100 MiB) and decoded duration budget. Configurable through BGM_MAX_RENDER_SECONDS, BGM_MAX_SCENES and BGM_MAX_UPLOAD_BYTES.
+- Streaming, sequence and track render calls validate budgets before rendering. Decoding applies a time limit and an upper bound on decoded length.
+- Cache reuse requires recorded output size and SHA-256 match (including requested stems/MIDI); SoundFont content changes invalidate render identity.
+- All FFmpeg/FFprobe subprocess calls now have timeouts (BGM_FFMPEG_TIMEOUT, default 180 s). Incompatible pyfluidsynth environments produce explicit diagnostic errors.
+- MCP tool input and output paths are confined to operator-specified directories. Narration via MCP requires BGM_MCP_INPUT_DIR; outputs default to BGM_MCP_OUTPUT_DIR or BGM_OUT_DIR.
+- REST /health no longer returns an absolute SoundFont path; API key comparison is constant-time. Uploads with advertised excessive body sizes are rejected before multipart parsing, and the copy loop enforces a byte limit.
+- Added eight no-synthesizer regression tests for security and integrity. Windows audio, remote deployment security and full compatibility testing still required.
+- setup.bat no longer upgrades pip automatically.
+
 # Changelog
 
 ## 0.10.0 (2026-11-10): cue sheets, stems and provenance
@@ -73,3 +108,6 @@ Fixes from the 0.7 review. Each one has a regression test in `tests/test_regress
 
 ## 0.7
 - Per-scene sequences, tempo matching, synthesised transitions, single-file client.
+
+### Windows test portability correction
+- Skip `test_soundfont_licence_follows_symlinks_and_overrides` only when Windows denies symlink creation with WinError 1314. All other symlink errors still fail the test; no runtime code or licensing behavior changed.

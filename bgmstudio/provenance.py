@@ -47,13 +47,22 @@ def file_sha256(path: str) -> str:
     return h.hexdigest()
 
 
-def _cached_sha(path: str) -> str:
+def cached_sha256(path: str) -> str:
+    """SHA-256 of a file, computed once per process for each (real path, size, mtime) and reused after that.
+    Any change to the file changes its size or modification time, so a modified file is hashed again."""
     st = os.stat(path)
     key = (os.path.realpath(path), st.st_size, st.st_mtime_ns)
     with _sha_lock:
-        if key not in _sha_cache:
-            _sha_cache[key] = file_sha256(path)
-        return _sha_cache[key]
+        hit = _sha_cache.get(key)
+    if hit is not None:
+        return hit
+    digest = file_sha256(path)  # outside the lock: large files must not block other lookups
+    with _sha_lock:
+        _sha_cache[key] = digest
+    return digest
+
+
+_cached_sha = cached_sha256  # older name
 
 
 def soundfont_license(path: str) -> dict:

@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from typing import Optional, Union
 
 try:  # MCP Python SDK 2.x renamed FastMCP -> MCPServer
@@ -25,6 +26,27 @@ def _slim(r: dict) -> dict:
     """Agents get the cue sheet without the per-bar list (it can run to thousands of entries); the full sheet is
     in the file at meta_path."""
     return {**r, "cues": cue_summary(r["cues"])} if "cues" in r else r
+
+def _approved_output(directory: Optional[str]) -> str:
+    """MCP does not grant an agent ambient output-directory authority."""
+    root = os.path.realpath(os.path.abspath(os.environ.get("BGM_MCP_OUTPUT_DIR", service.OUT_DIR)))
+    candidate = os.path.realpath(os.path.abspath(directory or root))
+    if os.path.commonpath((root, candidate)) != root:
+        raise ValueError("MCP output directory must be inside BGM_MCP_OUTPUT_DIR")
+    return candidate
+
+
+def _approved_narration(path: str) -> str:
+    """Narration reads require an operator-configured input workspace."""
+    root = os.environ.get("BGM_MCP_INPUT_DIR")
+    if not root:
+        raise ValueError("Set BGM_MCP_INPUT_DIR before allowing MCP narration access")
+    root = os.path.realpath(os.path.abspath(root))
+    candidate = os.path.realpath(os.path.abspath(path))
+    if os.path.commonpath((root, candidate)) != root:
+        raise ValueError("MCP narration must be inside BGM_MCP_INPUT_DIR")
+    return candidate
+
 
 mcp = FastMCP("bgmstudio")
 
@@ -53,7 +75,7 @@ def generate_bgm(mood: str = "calm", duration_seconds: float = 60.0, loop: bool 
     "provenance" (seed, engine version, SoundFont and its licence, file hashes).
     """
     return _slim(service.generate_bgm(mood, duration_seconds, loop=loop, seed=seed, key=key, bpm=bpm, format=format,
-                                      target_lufs=target_lufs, out_dir=output_dir, midi=also_midi,
+                                      target_lufs=target_lufs, out_dir=_approved_output(output_dir), midi=also_midi,
                                       intensity=intensity, stems=stems))
 
 
@@ -73,7 +95,7 @@ def generate_scene_sequence(scenes: list[dict], xfade: float = 2.0, seed: Option
     stems=True also writes one file per instrument group plus "fx" (the transitions); they add up to the track.
     The result includes "cues" (scene, section and transition times) and "provenance"."""
     return _slim(service.generate_sequence(scenes, xfade=xfade, seed=seed, key=key, format=format,
-                                           target_lufs=target_lufs, out_dir=output_dir, tempo_match=tempo_match,
+                                           target_lufs=target_lufs, out_dir=_approved_output(output_dir), tempo_match=tempo_match,
                                            max_bpm_jump=max_bpm_jump, transitions=transitions,
                                            fx_level_db=fx_level_db, stems=stems))
 
@@ -93,9 +115,9 @@ def mix_with_narration(narration_path: str, mood: str = "calm", lead_in: float =
     stems=True also writes voice / music / fx files (aligned and ducked) that add up to the mix.
     The result includes "cues" (in mix time, with the narration's start/end) and "provenance".
     """
-    return _slim(service.mix_with_narration(narration_path, mood, lead_in=lead_in, tail_out=tail_out,
+    return _slim(service.mix_with_narration(_approved_narration(narration_path), mood, lead_in=lead_in, tail_out=tail_out,
                                       music_lufs=music_lufs, duck_db=duck_db, final_lufs=final_lufs, seed=seed,
-                                      format=format, out_dir=output_dir, scenes=scenes, xfade=xfade,
+                                      format=format, out_dir=_approved_output(output_dir), scenes=scenes, xfade=xfade,
                                       tempo_match=tempo_match, max_bpm_jump=max_bpm_jump,
                                       transitions=transitions, fx_level_db=fx_level_db, intensity=intensity,
                                       stems=stems))

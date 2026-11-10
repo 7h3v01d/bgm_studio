@@ -97,6 +97,9 @@ def _import_fluidsynth():
 
 def _make_synth(plan: Plan, soundfont: str, sr: int):
     fluidsynth = _import_fluidsynth()
+    if not callable(getattr(fluidsynth, "Synth", None)):
+        raise RuntimeError("Incompatible fluidsynth Python module: missing Synth; install pyfluidsynth>=1.3.4 "
+                           "and remove any conflicting package named fluidsynth")
     fs = fluidsynth.Synth(gain=SYNTH_GAIN, samplerate=float(sr))
     sfid = fs.sfload(soundfont)
     if sfid < 0:

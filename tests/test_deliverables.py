@@ -185,7 +185,15 @@ def test_soundfont_licence_follows_symlinks_and_overrides(tmp_path, monkeypatch)
     real.parent.mkdir()
     real.write_bytes(b"sfbk")
     link = tmp_path / "default-GM.sf2"
-    link.symlink_to(real)
+    try:
+        link.symlink_to(real)
+    except OSError as exc:
+        # Windows without Developer Mode / symlink privilege raises WinError 1314.
+        # The application is not at fault; preserve the symlink-specific assertions
+        # for environments that can create the link.
+        if getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symlink creation requires Developer Mode or privilege (WinError 1314)")
+        raise
     assert provenance.soundfont_license(str(link))["license"] == "MIT"
     (tmp_path / "fonts" / "FluidR3_GM.license.txt").write_text("Custom licence line\nmore")
     assert provenance.soundfont_license(str(link)) == {"license": "Custom licence line",

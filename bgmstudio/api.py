@@ -8,12 +8,12 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 import tempfile
+import secrets
 from typing import List, Optional, Union
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
+from fastapi import Request, Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -25,9 +25,29 @@ app = FastAPI(title="bgmstudio", version=__version__,
               description="Procedural MIDI background music: exact duration, seamless loops, streaming, voice ducking.")
 
 
+@app.middleware("http")
+async def reject_oversized_multipart(request: Request, call_next):
+    # Fail early for clients that advertise a body length; the copy loop still
+    # enforces the actual byte cap even when Content-Length is omitted or forged.
+    if request.url.path == "/mix" and request.method == "POST":
+        advertised = request.headers.get("content-length")
+        if advertised is not None:
+            try:
+                length = int(advertised)
+            except ValueError:
+                # middleware runs outside FastAPI's exception handling: return the response, don't raise
+                from fastapi.responses import JSONResponse
+                return JSONResponse({"detail": "invalid Content-Length"}, status_code=400)
+            # Allow limited multipart framing on top of the narration payload.
+            if length > service.MAX_NARRATION_BYTES + 1024 * 1024:
+                from fastapi.responses import JSONResponse
+                return JSONResponse({"detail": "narration upload too large"}, status_code=413)
+    return await call_next(request)
+
+
 def auth(x_api_key: Optional[str] = Header(default=None)):
     want = os.environ.get("BGM_API_KEY")
-    if want and x_api_key != want:
+    if want and not secrets.compare_digest(x_api_key or "", want):
         raise HTTPException(401, "Invalid or missing X-API-Key")
 
 
@@ -87,6 +107,10 @@ def _guard(fn, *a, **kw):
         return fn(*a, **kw)
     except ValueError as e:
         raise HTTPException(422, str(e))
+    except subprocess.TimeoutExpired as e:
+        raise HTTPException(504, f"audio processor timed out: {e.cmd}")
+    except TimeoutError as e:  # the render lock: another long render is running
+        raise HTTPException(503, f"busy with another render, retry shortly ({e})", headers={"Retry-After": "30"})
     except (FileNotFoundError, RuntimeError, subprocess.CalledProcessError) as e:
         raise HTTPException(500, str(e))
 
@@ -122,7 +146,7 @@ def health():
         sf = find_soundfont()
     except FileNotFoundError as e:
         return {"ok": False, "error": str(e)}
-    return {"ok": True, "soundfont": sf}
+    return {"ok": True, "soundfont_available": True}
 
 
 @app.get("/moods", dependencies=[Depends(auth)])
@@ -206,7 +230,12 @@ def mix(narration: UploadFile = File(...), mood: str = Form("calm"),
     with tempfile.TemporaryDirectory() as d:
         src = os.path.join(d, "narration" + suffix)
         with open(src, "wb") as f:
-            shutil.copyfileobj(narration.file, f)
+            size = 0
+            while chunk := narration.file.read(1024 * 1024):
+                size += len(chunk)
+                if size > service.MAX_NARRATION_BYTES:
+                    raise HTTPException(413, "narration exceeds upload byte budget")
+                f.write(chunk)
         r = _guard(service.mix_with_narration, src, mood, lead_in=lead_in, tail_out=tail_out,
                    music_lufs=music_lufs, duck_db=duck_db, final_lufs=final_lufs, seed=seed, key=key, format=format,
                    scenes=scene_list, xfade=xfade, tempo_match=tempo_match,

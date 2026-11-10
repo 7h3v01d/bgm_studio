@@ -53,7 +53,7 @@ pip install -r requirements.txt
 #   Debian/Ubuntu: sudo apt install ffmpeg libfluidsynth3 fluid-soundfont-gm
 #   macOS:         brew install ffmpeg fluidsynth
 #   Windows:       install FluidSynth (add its bin/ to PATH) and ffmpeg
-python selftest.py          # ~2 minutes, should end with ALL PASSED
+python selftest.py          # full integration test, should end with ALL PASSED
 ```
 
 **Sound quality = your SoundFont.** The service auto-finds one, but the tiny default GM font is thin. For a big
@@ -228,4 +228,45 @@ Launchers (double-click): `run_server.bat` (API on 127.0.0.1:8765, docs at `/doc
   Quality scales with the SoundFont and with how much you tweak presets.
 * Streaming can't do seamless loops (the tail fold needs the finished render); use `/bgm` with `loop=true`.
   Rendering runs ~50-75x realtime on one core, so even a 1-hour file takes about a minute.
-* Duration range is 4 s to 2 hours. Very short clips (a few seconds) may speed up the tempo noticeably to fit whole bars.
+* Duration range is 4 s to 2 hours (`BGM_MAX_RENDER_SECONDS`, default 7200, can lower it). Very short clips (a few seconds) may speed up the tempo noticeably to fit whole bars.
+
+
+## v0.10.1 hardening / operational limits
+
+**This is a targeted local-first hardening release, not a certification for public Internet hosting.**
+The default limits are deliberately conservative for single-user desktop systems:
+
+| Environment variable | Default | Purpose |
+| --- | --- | --- |
+| `BGM_MAX_RENDER_SECONDS` | `7200` | Maximum total generated output, including narration lead/tail (the documented 2-hour limit; set lower on small machines) |
+| `BGM_MAX_SCENES` | `100` | Maximum accepted scenes per sequence/mix |
+| `BGM_MAX_UPLOAD_BYTES` | `104857600` | Maximum uploaded/input narration bytes (100 MiB) |
+| `BGM_FFMPEG_TIMEOUT` | `180` | FFmpeg/FFprobe timeout in seconds |
+| `BGM_LOCK_TIMEOUT` | `600` | Windows process lock acquisition deadline in seconds |
+| `BGM_MCP_OUTPUT_DIR` | `BGM_OUT_DIR` or `bgm_out` | Root of allowed MCP output directory tree |
+| `BGM_MCP_INPUT_DIR` | unset (narration denied) | Root of allowed MCP narration input files |
+
+Explicitly configure `BGM_MCP_INPUT_DIR` before exposing narration mixing through MCP.
+Symlinks are resolved for MCP directory checks; paths outside the configured roots are refused.
+Outputs use a new request fingerprint and will not reuse filenames from older releases.
+File hashes in the metadata are checked before reusing cached results. Each file is hashed once per process and
+re-hashed only if its size or modification time changes. Cache hits are answered without waiting for the render
+lock, so they never queue behind a long render. Cache names follow `ENGINE_REVISION` in `service.py` (bump it when
+the audio for a given request changes), not the package version.
+
+**Deployment boundary:** REST and MCP should be kept on `127.0.0.1` by default. Do not expose
+this service to untrusted users without a separate access-control layer and rate/size limits.
+The REST `/files` endpoint still uses a shared output namespace, not per-user ownership.
+Multipart bodies may be spooled by the framework before the endpoint copy limit is applied;
+for Internet exposure, an ingress/proxy body-size cap is mandatory. Untrusted media still
+needs process-level isolation for comprehensive decoder security.
+
+**Known limits:** streaming audio is not globally admission-controlled across separate API
+workers; the cross-process lock protects file renders within a shared output directory only.
+Use one API worker for trusted local use. A production-grade job queue, CPU/memory quotas,
+external task cancellation, dependency lockfile, complete Windows audio integration tests
+and authenticated per-client artifact ownership remain future work.
+
+For a clean Windows environment, run `setup.bat`, install the Native FluidSynth DLLs,
+and check that `python -c "import fluidsynth; print(fluidsynth.Synth)"` succeeds in the project
+virtual environment. The `pyfluidsynth` Python package is distinct from the native library.

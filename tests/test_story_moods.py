@@ -39,14 +39,15 @@ def test_original_moods_are_note_identical_to_0_8():
         assert (_fingerprint(p), round(p.bpm, 4), p.key, p.mode) == (h, bpm, key, mode), k
 
 
-def test_cache_name_unchanged_when_intensity_unused(tmp_path):
-    """Files cached by 0.8 are still found: intensity only joins the cache key when it is used."""
+def test_cache_name_includes_0101_engine_and_soundfont_digest(tmp_path):
+    """0.10.1 intentionally migrates cache names to content-based identifiers."""
     r = service.generate_bgm("calm", 5, seed=3, out_dir=str(tmp_path))
     from bgmstudio.render import find_soundfont
+    from bgmstudio.provenance import file_sha256
     sf = find_soundfont()
     params = dict(mood="calm", duration=5.0, loop=False, seed=3, key=None, mode=None, bpm=None, fmt="wav",
-                  lufs=-20.0, fade=3.0, sf=f"{os.path.basename(sf)}:{os.path.getsize(sf)}")
-    h = hashlib.sha1(json.dumps(params, sort_keys=True, default=str).encode()).hexdigest()[:12]
+                  lufs=-20.0, fade=3.0, sf_sha256=file_sha256(sf))
+    h = service._request_hash(params)
     assert os.path.basename(r["path"]) == f"bgm_calm_5s_3_{h}.wav"
     r2 = service.generate_bgm("calm", 5, seed=3, out_dir=str(tmp_path), intensity=0.5)
     assert r2["path"] != r["path"]
