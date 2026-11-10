@@ -1,11 +1,11 @@
 # BGM Studio
 
-<img width="1280" height="900" alt="screenshot" src="/docs/images/screenshot.png" />
-
 Procedural background music, composed on demand. Ask for a mood and a length and BGM Studio composes an original
 instrumental piece, renders it with FluidSynth and a General MIDI SoundFont, and returns a file of exactly that
 length. It can also score a narration: music fitted under a voice-over, dipped while someone speaks, delivered as a
 finished, loudness-normalised mix.
+
+<img width="1280" height="900" alt="screenshot" src="/docs/images/screenshot.png" />
 
 It runs locally and is reachable from a desktop console, a REST API, an MCP server for AI agents, a command line and
 Python.
