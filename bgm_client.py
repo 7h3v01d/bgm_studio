@@ -1,11 +1,11 @@
 """bgm_client.py: single-file client for the bgmstudio music service.
 
-Copy this file into your studio project.  It needs only `httpx` (no bgmstudio imports), so it works from any venv.
+Copy this file into the calling project.  It needs only `httpx` (no bgmstudio imports), so it works from any venv.
 
     from bgm_client import BGMClient
 
     # start_server() launches the service in the background if it isn't already running
-    with BGMClient(project_dir=r"G:\\Projects\\_Multimedia\\bgm_studio") as bgm:
+    with BGMClient(project_dir=r"C:\\tools\\bgm_studio") as bgm:
         bgm.music("lofi", 312.5, "bed.wav")                                  # exact-length bed
         bgm.music("ambient", 45, "loop.wav", loop=True)                      # seamless loop
         bgm.sequence([("calm", 20), ("cinematic", 25), ("dark", 20)], "score.wav")   # per-scene moods

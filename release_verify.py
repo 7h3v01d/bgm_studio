@@ -20,6 +20,35 @@ PACKAGES = ('numpy', 'soundfile', 'mido', 'pyfluidsynth', 'fastapi', 'uvicorn', 
             'python-multipart', 'mcp', 'httpx', 'pytest')
 
 
+# Not part of a release: local environments, native binaries, SoundFonts, generated audio and caches.
+EXCLUDED_DIRS = {'.venv', 'venv', '.git', '__pycache__', '.pytest_cache', 'bgm_out', 'gui_exports',
+                 'release_evidence', 'dist', 'build'}
+EXCLUDED_SUFFIXES = ('.log', '.pyc')
+# Folders where users install third-party binaries: only their instruction files are part of a release.
+NATIVE_DIRS = {'soundfonts', 'fluidsynth'}
+
+
+def release_files(root: Path) -> list[str]:
+    """Every distributable file under `root` (POSIX-style relative paths), excluding EXCLUDED_DIRS and the manifest."""
+    out = []
+    for path in root.rglob('*'):
+        rel = path.relative_to(root)
+        if rel.parts[0] in NATIVE_DIRS and not (len(rel.parts) == 2 and path.suffix.lower() == '.txt'):
+            continue
+        if (path.is_file() and not set(rel.parts[:-1]) & EXCLUDED_DIRS and rel.parts[0] not in EXCLUDED_DIRS
+                and rel.as_posix() != MANIFEST and not path.name.endswith(EXCLUDED_SUFFIXES)):
+            out.append(rel.as_posix())
+    return sorted(out)
+
+
+def write_manifest(root: Path, release: str, baseline: str) -> int:
+    files = release_files(root)
+    manifest = {'schema': 1, 'release': release, 'baseline': baseline,
+                'files': {name: hash_file(root / name) for name in files}}
+    (root / MANIFEST).write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
+    return len(files)
+
+
 def hash_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open('rb') as fh:
@@ -119,8 +148,14 @@ def main(argv=None) -> int:
     parser.add_argument('--root', type=Path, default=ROOT, help='project root (defaults to script folder)')
     parser.add_argument('--tests', action='store_true', help='run pytest then the end-to-end audio self-test')
     parser.add_argument('--capture-env', action='store_true', help='write local environment evidence JSON')
+    parser.add_argument('--write-manifest', metavar='RELEASE',
+                        help='regenerate the manifest for release RELEASE (e.g. 0.11.1) from the current files')
     args = parser.parse_args(argv)
     root = args.root.resolve()
+    if args.write_manifest:
+        n = write_manifest(root, args.write_manifest, f'v{args.write_manifest}')
+        print(f'[PASS] wrote {MANIFEST} for release {args.write_manifest} ({n} files)')
+        return 0
     ok, problems = verify(root)
     if not ok:
         for problem in problems:

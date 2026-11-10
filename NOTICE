@@ -1,0 +1,14 @@
+BGM Studio
+Copyright 2026 Leon Priest (GitHub: 7h3v01d)
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Third-party components are not distributed with this source and are installed separately by the user:
+
+  * FluidSynth (LGPL-2.1-or-later), used as a shared library through pyfluidsynth.
+  * FFmpeg / ffprobe (LGPL-2.1-or-later or GPL, depending on the build), invoked as external programs.
+  * A General MIDI SoundFont chosen by the user. Each SoundFont carries its own licence, which governs the
+    samples it contains; the provenance record written with every render names the SoundFont and its licence
+    where known. See docs/USER_MANUAL.md, "SoundFonts and licensing".
+
+Python dependencies are listed in requirements.txt and are subject to their own licences.

@@ -9,12 +9,10 @@ import time
 import numpy as np
 import soundfile as sf
 
-# This dedicated end-to-end test intentionally renders a 20-minute track.
-# Give only this self-test process a large enough budget before importing the
-# service (which reads the environment variable at import time). The default
-# 600-second production budget remains unchanged for normal invocations.
+# The self-test renders a 20-minute track. Make sure the render budget allows it even if the environment has
+# lowered BGM_MAX_RENDER_SECONDS (the service reads it at import time, so set it before importing).
 _selftest_min_seconds = 1200
-_selftest_configured_budget = float(os.environ.get("BGM_MAX_RENDER_SECONDS", "600"))
+_selftest_configured_budget = float(os.environ.get("BGM_MAX_RENDER_SECONDS", "7200"))
 os.environ["BGM_MAX_RENDER_SECONDS"] = str(max(_selftest_configured_budget, _selftest_min_seconds))
 os.environ["BGM_OUT_DIR"] = tempfile.mkdtemp(prefix="bgm_selftest_")
 from bgmstudio import service

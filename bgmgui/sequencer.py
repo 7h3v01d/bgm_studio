@@ -140,7 +140,7 @@ class SequencerTab(QWidget):
         for b in (self.add_btn, self.dup_btn, self.del_btn, self.up_btn, self.down_btn):
             bar.addWidget(b)
         bar.addStretch(1)
-        self.load_btn = self._tool("LOAD", self.load_file, "Open a scene file (.json), e.g. one InkHeart wrote")
+        self.load_btn = self._tool("LOAD", self.load_file, "Open a scene file (.json), e.g. one written by another tool")
         self.save_btn = self._tool("SAVE", self.save_file, "Save these scenes and settings as a .json scene file")
         bar.addWidget(self.load_btn)
         bar.addWidget(self.save_btn)

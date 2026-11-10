@@ -1,1 +1,2 @@
-Windows: unzip the FluidSynth x64 release here (the .dll files must end up in this folder, a bin subfolder, or one folder down).
+Windows: unzip the FluidSynth x64 release into this folder. The .dll files may be in this folder, in a bin
+subfolder, or one folder down. See docs/USER_MANUAL.md, section 2.2.

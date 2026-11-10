@@ -1,1 +1,2 @@
-Put your .sf2 SoundFont here (GeneralUser GS or FluidR3_GM recommended).
+Place a General MIDI SoundFont (.sf2) in this folder. GeneralUser GS or FluidR3_GM is recommended.
+See docs/USER_MANUAL.md, section 2.5, for licensing.

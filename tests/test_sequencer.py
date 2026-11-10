@@ -91,7 +91,7 @@ def test_scene_file_round_trip():
 
 
 def test_scene_file_accepts_api_body_and_bare_list():
-    """InkHeart/Reelwright can hand over exactly what they send to /sequence."""
+    """Other tools can hand over exactly what they send to /sequence."""
     body = {"scenes": [{"mood": "Horror", "duration": 12, "intensity": [0.2, 0.8]}], "transitions": "auto"}
     r, s = load_scene_file(json.dumps(body), MOODS)
     assert r[0]["mood"] == "horror" and r[0]["intensity"] == pytest.approx(0.5) and s == DEFAULT_SETTINGS

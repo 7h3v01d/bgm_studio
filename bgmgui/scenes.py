@@ -6,7 +6,7 @@ A scene row in the editor is a dict:
     {"mood": str, "duration": float, "intensity": float | None, "transition": str, "bpm": float | None}
 where transition "default" means "use the sequence's default transition".  to_api() turns rows into the list the
 REST API / bgm_client take.  Scene files use the same shape as the API ({"scenes": [...]}) plus the editor's
-settings, so InkHeart or Reelwright can write one and the console can open it.
+settings, so other tools (a story engine, a video pipeline) can write one and the console can open it.
 """
 from __future__ import annotations
 
